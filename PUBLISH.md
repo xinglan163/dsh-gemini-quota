@@ -124,10 +124,11 @@ dsh plugin --profile <p> add github:xinglan163/dsh-gemini-quota
 
 工作流已在 `.github/workflows/publish.yml`。启用只需要在 npm 侧登记一次：
 
-1. 打开 **https://www.npmjs.com/package/dsh-gemini-quota/settings**
-   （或包页面 → `Settings` 标签）
-2. 找到 **Trusted Publishing**（旧界面叫 Publishing access / Trusted Publisher）
-3. `Add a trusted publisher` → 选 **GitHub Actions**，填：
+1. 打开 **https://www.npmjs.com/package/dsh-gemini-quota/access**
+   （这是包设置页；点路径是：包页面 → 右侧 **Settings** → **Trusted Publisher** 一节。
+   注意 `/settings` 这种 URL 是 404，npm 用的是 `/access`）
+2. **Select your publisher** → 点 **GitHub Actions**
+3. 填：
 
    | 字段 | 值 |
    |---|---|
@@ -136,7 +137,7 @@ dsh plugin --profile <p> add github:xinglan163/dsh-gemini-quota
    | Workflow filename | `publish.yml` |
    | Environment name | 留空 |
 
-4. 保存（会要求 2FA 验证）
+4. 保存（会要求 2FA 验证）；文档另提到启用后到 Overview → Publishing access → **Update Package Settings** 再存一次
 
 之后发版只需三步：
 
