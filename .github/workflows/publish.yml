@@ -4,11 +4,15 @@
 # 否则 npm 会拒绝（缺少可信发布者绑定）。
 name: publish
 
+# 目前只保留手动触发：本账号被 GitHub 账单锁挡住，Actions 任务无法启动，
+# 若留着 push.tags 触发，每次推 tag 都会产生一个失败记录（红叉）。
+# 账单恢复后把下面 restore 注释里的三行填回 on: 之下即可恢复"推 tag 自动发布"。
 on:
-  push:
-    tags:
-      - "v*"          # v0.1.1 / v1.0.0 …
-  workflow_dispatch:  # 也支持手动触发（版本已存在时会失败，属预期）
+  workflow_dispatch:
+  # restore（账单恢复后取消注释）:
+  # push:
+  #   tags:
+  #     - "v*"        # v0.1.1 / v1.0.0 …
 
 permissions:
   contents: read

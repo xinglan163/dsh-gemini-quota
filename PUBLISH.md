@@ -158,3 +158,23 @@ git tag v0.1.1 && git push origin main --tags
 - npm 页面上会出现 "Built and signed on GitHub Actions" 的 provenance 徽章；
 - 本地 `npm publish` 仍需 OTP；CI 这条路完全不需要；
 - 如果包名/工作流文件名改了，必须同步改 npm 侧的登记，否则报 `not authorized`。
+
+## 7. 没有 CI 时的日常发版（当前采用）
+
+本账号的 GitHub Actions 被**账单问题**锁住（注解原文：*The job was not started because
+your account is locked due to a billing issue.*），任务在启动前就被拦，所以自动发布暂时不可用。
+`.github/workflows/publish.yml` 已改为**仅手动触发**，推 tag 不会再产生失败红叉。
+
+日常发版改走本地脚本：
+
+```sh
+npm login                 # 只需一次
+./scripts/release.sh patch   # 或 minor / major / 1.0.0
+```
+
+脚本会：自测 → 提版本 → 提交 → 打 tag → 推 GitHub → `npm publish`（提示输 6 位 OTP）。
+
+**与 CI 的唯一差别**：没有 OIDC provenance 签名，npm 页面不会出现
+"Built and signed on GitHub Actions" 徽章。功能与安装完全不受影响。
+
+账单恢复后想切回自动发布：把 `publish.yml` 里 `restore` 注释的三行填回 `on:` 之下即可。
