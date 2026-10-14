@@ -192,3 +192,31 @@ dsh plugin --profile <profile> update dsh-gemini-quota --config.minimumReleaseAg
 
 实测：发布后立刻更新被拦，加上这个参数后 2.9 秒装到新版本。
 DSH 插件页安装走的是同一个 pnpm，所以新版发布后可能需要等一段时间才会被装上。
+
+### publish 返回 202，要等几分钟才可见（实测，重要）
+
+本账号每次 `npm publish` 的 registry 响应都是 **202 Accepted**，并打印
+*"Your package is being processed and may take a few minutes to become available."*——
+**`npm publish` 成功 ≠ 立刻可安装**：
+
+| 版本 | 提交时刻 | 上线时刻 | 延迟 |
+|---|---|---|---|
+| 0.1.0 | 15:00:28 | 15:01:49 | ~80 秒 |
+| 0.1.3 | 15:50:27 | 15:51:47 | ~80 秒 |
+| 0.1.4 | 15:56:03 | 16:00:35 | **~4.5 分钟** |
+
+判断是否真的上线（packument 有 CDN 缓存，要看**版本专属清单**）：
+
+```sh
+curl -s -o /dev/null -w '%{http_code}\n' \
+  https://registry.npmjs.org/dsh-gemini-quota/0.1.4    # 200 = 已上线，404 = 还在处理
+# 或用按需回源的 CDN 交叉验证：
+curl -s -o /dev/null -w '%{http_code}\n' https://unpkg.com/dsh-gemini-quota@0.1.4/package.json
+```
+
+**别急着重发**：版本号已被接受，重复发布会因版本已存在被拒；
+排查发布到底发生了什么，看 npm 调试日志最直接：
+
+```sh
+grep -E 'PUT [0-9]+|being processed|web auth' $(ls -t ~/.npm/_logs/*.log | head -1)
+```

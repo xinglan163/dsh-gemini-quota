@@ -58,6 +58,8 @@ echo
 if [ "${dry}" = "1" ]; then
   echo "✅ 排练完成（未发布、未改动）。去掉 DRY_RUN=1 即可真发。"
 else
-  echo "✅ 已发布 dsh-gemini-quota@${version}"
-  echo "   核验： npm view dsh-gemini-quota version"
+  echo "✅ 已提交发布 dsh-gemini-quota@${version}"
+  echo "   npm 是异步处理（registry 返回 202），通常 1-5 分钟后才可见，别急着重发。"
+  echo "   核验是否真上线（200 = 已上线）："
+  echo "     curl -s -o /dev/null -w '%{http_code}\\n' https://registry.npmjs.org/dsh-gemini-quota/${version}"
 fi
