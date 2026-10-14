@@ -369,30 +369,28 @@ window.__ModuleLoader__.load({
                   left: "50%",
                   transform: "translateX(-50%)",
                   zIndex: 1000,
-                  // 官方 tooltip 规范（dsh-client-ui-primitives/Tooltip.module.css）：
-                  // 长文案靠 max-width + 换行收边，而不是无限拉宽。
                   width: "max-content",
                   maxWidth: "min(50vw, 520px)",
                   whiteSpace: "normal",
                   overflowWrap: "break-word",
                   pointerEvents: "none",
-                  padding: "3px 7px",
+                  padding: "6px 10px",
                   borderRadius: "var(--dsw-radius-sm, 8px)",
-                  // 跟随 DSH 主题（和 dsh-codex-connect 用同一对 token）：
-                  //   暗色主题 --dsw-alias-tooltip-bg = bluish-750 = #43454a（中灰）
-                  //   亮色主题 --dsw-alias-tooltip-bg = bluish-850 = #2c2c2e（深灰）
-                  //   文字恒为 --dsw-static-neutral-bluish-00 = #fff
-                  // 之前硬编码 #2b3038（接近黑）：暗色主题下比官方 tooltip 明显更黑，
-                  // 看着就是"一直是黑的"。改成 token 后任何主题/皮肤插件都会跟着变。
-                  background: "var(--dsw-alias-tooltip-bg, #43454a)",
-                  color: "var(--dsw-static-neutral-bluish-00, #fff)",
-                  boxShadow: "var(--dsw-shadow-lv2, 0 4px 12px rgba(0, 0, 0, 0.28))",
+                  background: "var(--dsw-specific-menu, var(--dsw-alias-bg-layer-2, #f2f3f5))",
+                  backdropFilter: "var(--dsw-menu-backdrop-filter, blur(20px))",
+                  WebkitBackdropFilter: "var(--dsw-menu-backdrop-filter, blur(20px))",
+                  color: "var(--dsw-alias-label-primary, #151517)",
+                  border: "1px solid var(--dsw-alias-border-l2, rgba(0, 0, 0, 0.08))",
+                  boxShadow: "var(--dsw-elevation-soft, var(--dsw-shadow-lv2, 0 4px 16px rgba(0, 0, 0, 0.08)))",
                   fontSize: 13,
-                  fontWeight: 500,
+                  fontWeight: 400,
                   lineHeight: "20px",
+                  display: "flex",
+                  flexDirection: "column",
+                  gap: 4,
                 },
               },
-              label,
+              rows.map((r) => h("div", { key: r.kind }, `${r.short}：剩余 ${r.metric.remainingPercent}%；重置时间 ${r.metric.resetTime} (${r.metric.account})`)),
             )
           : null,
       );
