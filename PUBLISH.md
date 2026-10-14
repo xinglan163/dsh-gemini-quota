@@ -119,3 +119,41 @@ npm publish --access public
 npm pack && dsh plugin --profile <p> add ./dsh-gemini-quota-0.1.0.tgz
 dsh plugin --profile <p> add github:xinglan163/dsh-gemini-quota
 ```
+
+## 6. 可信发布（OIDC）：推 tag 自动发版，免 token 免 OTP
+
+工作流已在 `.github/workflows/publish.yml`。启用只需要在 npm 侧登记一次：
+
+1. 打开 **https://www.npmjs.com/package/dsh-gemini-quota/settings**
+   （或包页面 → `Settings` 标签）
+2. 找到 **Trusted Publishing**（旧界面叫 Publishing access / Trusted Publisher）
+3. `Add a trusted publisher` → 选 **GitHub Actions**，填：
+
+   | 字段 | 值 |
+   |---|---|
+   | Organization or user | `xinglan163` |
+   | Repository | `dsh-gemini-quota` |
+   | Workflow filename | `publish.yml` |
+   | Environment name | 留空 |
+
+4. 保存（会要求 2FA 验证）
+
+之后发版只需三步：
+
+```sh
+cd plugins/dsh-gemini-quota
+npm version patch --no-git-tag-version   # 或手改 package.json
+git commit -am "chore: release 0.1.1"
+git tag v0.1.1 && git push origin main --tags
+```
+
+工作流会：语法检查 → 跑 `selftest.mjs` → 校验 **tag 与 package.json 版本一致** →
+`npm publish --provenance`（OIDC 换凭证，**不需要任何 secret**）。
+
+要点：
+
+- 预发布版本（`0.2.0-alpha.1`）自动发到 `alpha` dist-tag，不会污染 `latest`；
+- **tag 与 package.json 版本不一致会直接失败**，避免发错版本号；
+- npm 页面上会出现 "Built and signed on GitHub Actions" 的 provenance 徽章；
+- 本地 `npm publish` 仍需 OTP；CI 这条路完全不需要；
+- 如果包名/工作流文件名改了，必须同步改 npm 侧的登记，否则报 `not authorized`。
