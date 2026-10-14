@@ -1,0 +1,61 @@
+{
+  "name": "dsh-gemini-quota",
+  "version": "0.1.0",
+  "description": "在 DeepSeek Harness 输入框旁显示 Gemini 网页端 5 小时 / 每周额度小条（数据来自本地 gemini-web2api-go 反代）。",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "dsh-plugin",
+    "dsh-bundle",
+    "gemini",
+    "quota",
+    "usage",
+    "gemini-web2api"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/xinglan163/dsh-gemini-quota.git"
+  },
+  "homepage": "https://github.com/xinglan163/dsh-gemini-quota#readme",
+  "bugs": {
+    "url": "https://github.com/xinglan163/dsh-gemini-quota/issues"
+  },
+  "icon": "./icon.svg",
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "icon.svg",
+    "README.md",
+    "LICENSE"
+  ],
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-client-ui-model-selection"
+      ]
+    }
+  },
+  "author": "Jinci Xiao (xinglan163)"
+}

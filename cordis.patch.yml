@@ -1,0 +1,22 @@
+# 组合包 patch。安装后 DSH 用这份声明挂载宿主半 entry。
+#
+# 注意：这里**不放任何机器专属路径**。provider 范围、反代地址都在 config 里，
+# 使用者可在自己 profile 的 cordis.patch.yml 里按 id 覆盖，或改这里。
+- insert:
+    - id: gemini-web-quota
+      name: dsh-gemini-quota
+      config:
+        # gemini-web2api-go 反代地址
+        baseUrl: http://127.0.0.1:8083
+        # 哪些 DSH provider id 触发额度条（宿主会下发给浏览器半做门控）
+        providers: [gemini-web]
+        # 额外按模型名前缀 gemini-* 兜底
+        matchModelPrefix: true
+        # admin token 来源，按顺序尝试：
+        #   1) token（直接写，不推荐）
+        #   2) tokenEnv 指向的环境变量（默认 GEMINI_WEB_ADMIN_TOKEN）
+        #   3) envFile 指定的文件
+        #   4) $DSH_HOME/gemini-web2api.env（默认 ~/.dsh/gemini-web2api.env）
+        tokenEnv: GEMINI_WEB_ADMIN_TOKEN
+        # envFile: /path/to/gemini-web2api/.env
+        timeoutMs: 8000

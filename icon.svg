@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" role="img" aria-label="Gemini quota">
+  <rect x="3" y="9" width="18" height="7" rx="3.5" fill="none" stroke="currentColor" stroke-width="1.6"/>
+  <rect x="5.2" y="11.2" width="9" height="3.6" rx="1.8" fill="currentColor"/>
+  <circle cx="19.6" cy="12.5" r="1.1" fill="currentColor"/>
+</svg>
