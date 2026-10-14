@@ -82,6 +82,7 @@ dsh plugin --profile <profile> add github:xinglan163/dsh-gemini-quota
 | 502 `quota upstream ...` | 反代没跑、端口不对、或 admin token 无效 |
 | 403 `forbidden` | 不是从回环地址/同源访问的 |
 | 改了 `client.js` 界面没变 | `client-hmr` 对 `link:` 安装不一定生效，**刷新页面（Cmd+R）**最稳 |
+| 刚发布的新版装不上（`Already up to date`） | pnpm「最小发布年龄」保护：加 `--config.minimumReleaseAge=0`，或等一段时间 |
 
 ## 卸载
 

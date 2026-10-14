@@ -178,3 +178,17 @@ npm login                 # 只需一次
 "Built and signed on GitHub Actions" 徽章。功能与安装完全不受影响。
 
 账单恢复后想切回自动发布：把 `publish.yml` 里 `restore` 注释的三行填回 `on:` 之下即可。
+
+### 别人多久能装到新版（实测坑）
+
+pnpm 有「最小发布年龄」供应链保护：**刚发布几分钟的版本可能被拦**，
+表现是 `pnpm update dsh-gemini-quota` 回答 "Already up to date"，版本号不动。
+
+急着装就显式关掉这次检查：
+
+```sh
+dsh plugin --profile <profile> update dsh-gemini-quota --config.minimumReleaseAge=0
+```
+
+实测：发布后立刻更新被拦，加上这个参数后 2.9 秒装到新版本。
+DSH 插件页安装走的是同一个 pnpm，所以新版发布后可能需要等一段时间才会被装上。
