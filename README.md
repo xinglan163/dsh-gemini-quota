@@ -1,11 +1,8 @@
 # dsh-gemini-quota
 
-在 **DeepSeek Harness** 的输入框右侧显示一条 Gemini 网页端额度小条：
+在 **DeepSeek Harness** 输入框那一行、**模型切换器左侧**显示一条 Gemini 网页端额度小条：
 
-```
- 5h ████████░░░░░░  37%
- 7d ██████████████  87%
-```
+![Gemini 额度条：5h 37% / 7d 87%（悬停可看重置时间）](./docs/preview.png)
 
 - 只在**当前选中的模型属于 Gemini** 时出现，切到 DeepSeek / Codex 自动消失；
 - 鼠标悬停显示剩余量与重置时间（含账号）；

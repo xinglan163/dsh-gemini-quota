@@ -1,7 +1,7 @@
 {
   "name": "dsh-gemini-quota",
   "version": "0.1.2",
-  "description": "在 DeepSeek Harness 输入框旁显示 Gemini 网页端 5 小时 / 每周额度小条（数据来自本地 gemini-web2api-go 反代）。",
+  "description": "在 DeepSeek Harness 输入框的模型切换器左侧显示 Gemini 网页端 5 小时 / 每周额度小条（数据来自本地 gemini-web2api-go 反代）。",
   "license": "MIT",
   "type": "module",
   "engines": {
@@ -32,7 +32,8 @@
     "cordis.patch.yml",
     "icon.svg",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "docs/preview.png"
   ],
   "exports": {
     ".": "./index.js",
