@@ -369,19 +369,27 @@ window.__ModuleLoader__.load({
                   left: "50%",
                   transform: "translateX(-50%)",
                   zIndex: 1000,
-                  whiteSpace: "nowrap",
+                  // 官方 tooltip 规范（dsh-client-ui-primitives/Tooltip.module.css）：
+                  // 长文案靠 max-width + 换行收边，而不是无限拉宽。
+                  width: "max-content",
+                  maxWidth: "min(50vw, 520px)",
+                  whiteSpace: "normal",
+                  overflowWrap: "break-word",
                   pointerEvents: "none",
-                  padding: "4px 8px",
-                  borderRadius: 6,
-                  // 硬编码高对比：主题 token（tooltip-bg / label-primary-foreground）在这个构建里
-                  // 解析出来是「中灰底 + 中灰字」，糊成一片。tooltip 本身是浮层，深底白字在任何主题下都成立。
-                  background: "#2b3038",
-                  color: "#f7f8fa",
-                  border: "1px solid rgba(255, 255, 255, 0.16)",
-                  boxShadow: "0 6px 18px rgba(0, 0, 0, 0.45)",
-                  fontSize: 12.5,
+                  padding: "3px 7px",
+                  borderRadius: "var(--dsw-radius-sm, 8px)",
+                  // 跟随 DSH 主题（和 dsh-codex-connect 用同一对 token）：
+                  //   暗色主题 --dsw-alias-tooltip-bg = bluish-750 = #43454a（中灰）
+                  //   亮色主题 --dsw-alias-tooltip-bg = bluish-850 = #2c2c2e（深灰）
+                  //   文字恒为 --dsw-static-neutral-bluish-00 = #fff
+                  // 之前硬编码 #2b3038（接近黑）：暗色主题下比官方 tooltip 明显更黑，
+                  // 看着就是"一直是黑的"。改成 token 后任何主题/皮肤插件都会跟着变。
+                  background: "var(--dsw-alias-tooltip-bg, #43454a)",
+                  color: "var(--dsw-static-neutral-bluish-00, #fff)",
+                  boxShadow: "var(--dsw-shadow-lv2, 0 4px 12px rgba(0, 0, 0, 0.28))",
+                  fontSize: 13,
                   fontWeight: 500,
-                  lineHeight: "18px",
+                  lineHeight: "20px",
                 },
               },
               label,
