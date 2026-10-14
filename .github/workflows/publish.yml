@@ -56,6 +56,11 @@ jobs:
 
       - name: 校验 tag 与 package.json 版本一致
         run: |
+          # 手动 workflow_dispatch 时 GITHUB_REF_NAME 是分支名，校验 tag 会误报，这里跳过
+          if [ "${GITHUB_REF_TYPE:-}" != "tag" ]; then
+            echo "非 tag 触发（${GITHUB_REF_TYPE:-unknown}:${GITHUB_REF_NAME:-unknown}），跳过版本一致性校验"
+            exit 0
+          fi
           tag="${GITHUB_REF_NAME#v}"
           pkg="$(node -p "require('./package.json').version")"
           if [ "$tag" != "$pkg" ]; then
