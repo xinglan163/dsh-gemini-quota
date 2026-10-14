@@ -1,6 +1,6 @@
 {
   "name": "dsh-gemini-quota",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "在 DeepSeek Harness 模型切换器左侧显示一条 Gemini 网页端额度小条",
   "license": "MIT",
   "type": "module",

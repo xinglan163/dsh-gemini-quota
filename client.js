@@ -306,6 +306,8 @@ window.__ModuleLoader__.load({
           summary: `Gemini 5 小时额度：剩余 ${fmtPct(snapshot.fiveHour.remainPercent)}%；重置时间 ${resetText(
             snapshot.fiveHour.resetAt,
           )}`,
+          remainText: `${fmtPct(snapshot.fiveHour.remainPercent)}%`,
+          resetLabel: resetText(snapshot.fiveHour.resetAt),
           metric: snapshot.fiveHour,
         });
       }
@@ -316,6 +318,8 @@ window.__ModuleLoader__.load({
           summary: `Gemini 周额度：剩余 ${fmtPct(snapshot.weekly.remainPercent)}%；重置时间 ${resetText(
             snapshot.weekly.resetAt,
           )}`,
+          remainText: `${fmtPct(snapshot.weekly.remainPercent)}%`,
+          resetLabel: resetText(snapshot.weekly.resetAt),
           metric: snapshot.weekly,
         });
       }
@@ -323,6 +327,14 @@ window.__ModuleLoader__.load({
 
       const detail = rows.map((r) => r.summary).join("；");
       const label = snapshot.account ? `${detail}（账号 ${snapshot.account}）` : detail;
+
+      // 悬停浮层：一行一个信息（额度、重置时间各占一行），账号单独一行。
+      // 这里只消费上面算好的 remainText / resetLabel，不再直接摸 raw 字段，避免字段名写错又出 undefined。
+      const tipLines = rows.flatMap((r) => [
+        `${r.short} 额度：剩余 ${r.remainText}`,
+        `${r.short} 重置：${r.resetLabel}`,
+      ]);
+      if (snapshot.account) tipLines.push(`账号：${snapshot.account}`);
 
       return h(
         "span",
@@ -390,7 +402,7 @@ window.__ModuleLoader__.load({
                   gap: 4,
                 },
               },
-              rows.map((r) => h("div", { key: r.kind }, `${r.short}：剩余 ${r.metric.remainingPercent}%；重置时间 ${r.metric.resetTime} (${r.metric.account})`)),
+              tipLines.map((text, i) => h("div", { key: i }, text)),
             )
           : null,
       );
