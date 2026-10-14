@@ -20,10 +20,33 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # 刻意不设 registry-url：setup-node 会写一个空 _authToken 的 .npmrc，
+      # 让 npm 先尝试 token 认证并 ENEEDAUTH，**阻断 OIDC 可信发布**。
+      # npm 默认 registry 本来就是 registry.npmjs.org，无需指定。
       - uses: actions/setup-node@v4
         with:
           node-version: 24
-          registry-url: https://registry.npmjs.org
+
+      - name: 环境自检（OIDC / npm 版本）
+        run: |
+          echo "node: $(node --version)"
+          echo "npm:  $(npm --version)"
+          echo "registry: $(npm config get registry)"
+          if [ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
+            echo "OIDC: 可用"
+          else
+            echo "::error::OIDC 不可用——检查 workflow 的 permissions.id-token: write"
+            exit 1
+          fi
+
+      - name: 清理残留的 token 配置（确保走 OIDC 而非 token）
+        run: |
+          npm config delete //registry.npmjs.org/:_authToken || true
+          if grep -q '_authToken' ~/.npmrc 2>/dev/null; then
+            echo "::warning::~/.npmrc 里仍有 _authToken，可能干扰可信发布"
+          else
+            echo "无残留 token 配置"
+          fi
 
       - name: 语法与自测（零依赖，无需安装）
         run: |
