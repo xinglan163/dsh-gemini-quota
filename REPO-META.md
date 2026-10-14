@@ -33,6 +33,11 @@
 `dsh` / `deepseek-harness` / `dsh-plugin` 这几个 topic 是别人能搜到你的关键——
 DSH 插件页本身没有搜索目录，社区主要靠这些关键词和包名找。
 
+## 2.5 已上线
+
+- npm：https://www.npmjs.com/package/dsh-gemini-quota （`0.1.0`，latest）
+- 仓库：https://github.com/xinglan163/dsh-gemini-quota
+
 ## 3. 首次推送
 
 ```sh

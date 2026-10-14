@@ -68,6 +68,39 @@ DSH 插件页**没有搜索目录**，所以传播靠包名。建议：
 - 在 DSH 社区/Issue 里贴一句安装命令；
 - 需要时把包名加到自己的文档里。
 
+## 4.5 新包的「暂存发布」——实测流程（2026-10）
+
+首次发布**不会立刻生效**，npm 对新包启用了 staged publishing：
+
+1. `npm publish` 成功后，registry 上先出现一个占位版本 **`0.0.0-stage`**
+   （README 写着"临时占位，等待 staged release"）；
+2. 真版本随后自动转正——实测**约 1 分钟**后 `dist-tags.latest` 变成 `0.1.0`；
+3. 期间用 `npm view dsh-gemini-quota version` 会看到 `0.0.0-stage`，**不要慌、也不要重发**。
+
+判断是否真的上线，看这两个字段：
+
+```sh
+curl -s https://registry.npmjs.org/dsh-gemini-quota | \
+  python3 -c "import json,sys;d=json.load(sys.stdin);print(list(d['versions']), d['dist-tags'])"
+# 期望：versions 含你的版本；dist-tags.latest 指向它
+```
+
+**后续版本**（包已存在）不再走这套占位流程，`npm publish` 直接生效。
+
+想主动走暂存（先审后发、或 CI 里免 2FA 提交）用 npm **v12** 的 `npm stage`：
+
+```sh
+npm stage publish              # 提交到暂存区（不需要 2FA，可用任意 token）
+npm stage list dsh-gemini-quota
+npm stage view <stage-id>
+npm stage download <stage-id>  # 下载 tarball 自查
+npm stage approve <stage-id>   # 批准上线（**这一步要 2FA**）
+npm stage reject <stage-id>
+```
+
+npm 11 没有 `npm stage`；临时借用：
+`npx --yes npm@12 stage list dsh-gemini-quota`（会有 EBADENGINE 警告，功能正常）。
+
 ## 5. 版本与回滚
 
 ```sh
