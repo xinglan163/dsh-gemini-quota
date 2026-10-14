@@ -86,10 +86,11 @@ console.log("路由:", route.kind, route.path);
     expect(json.ok === true, `期望 ok:true，实际 ${JSON.stringify(json)}`);
     expect(typeof json.fiveHour?.usedPercent === "number", "fiveHour 字段缺失");
     passed.push("正常路径 200 + fiveHour/weekly 齐全");
-  } else if (status === 502) {
-    skipped.push(`正常路径（反代未运行：${json.error}）`);
+  } else if (status === 502 || status === 503) {
+    // CI / 别人机器上：没跑反代（502）或没配 admin token（503）都属正常，跳过而不是失败
+    skipped.push(`正常路径（反代未运行或未配 token：${json.error}）`);
   } else {
-    throw new Error(`期望 200/502，实际 ${status} ${JSON.stringify(json)}`);
+    throw new Error(`期望 200/502/503，实际 ${status} ${JSON.stringify(json)}`);
   }
   // scope 必须随响应下发，否则浏览器半无法门控
   expect(Array.isArray(json.providers), "响应缺少 providers");

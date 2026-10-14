@@ -1,0 +1,52 @@
+# 可信发布（Trusted Publishing / OIDC）：推 tag 即发布，不需要任何 NPM_TOKEN。
+#
+# 前置：在 npmjs.com 的包设置里登记本工作流（见 PUBLISH.md 第 6 节），
+# 否则 npm 会拒绝（缺少可信发布者绑定）。
+name: publish
+
+on:
+  push:
+    tags:
+      - "v*"          # v0.1.1 / v1.0.0 …
+  workflow_dispatch:  # 也支持手动触发（版本已存在时会失败，属预期）
+
+permissions:
+  contents: read
+  id-token: write    # OIDC 换取 npm 发布凭证 + 生成 provenance 签名，必需
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+
+      - name: 语法与自测（零依赖，无需安装）
+        run: |
+          node --check index.js
+          node --check client.js
+          node selftest.mjs
+
+      - name: 校验 tag 与 package.json 版本一致
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          pkg="$(node -p "require('./package.json').version")"
+          if [ "$tag" != "$pkg" ]; then
+            echo "::error::tag ($tag) 与 package.json version ($pkg) 不一致"
+            exit 1
+          fi
+          echo "版本一致：$pkg"
+
+      - name: 发布（provenance 由 OIDC 自动生成）
+        run: |
+          version="$(node -p "require('./package.json').version")"
+          case "$version" in
+            *-*) tag=alpha ;;   # 预发布版本发到 alpha dist-tag，不污染 latest
+            *)   tag=latest ;;
+          esac
+          echo "publishing $version (dist-tag: $tag)"
+          npm publish --provenance --access public --tag "$tag"
