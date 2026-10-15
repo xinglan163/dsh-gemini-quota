@@ -36,7 +36,8 @@
     "icon.svg",
     "README.md",
     "LICENSE",
-    "docs/preview.png"
+    "docs/preview.png",
+    "docs/pool.png"
   ],
   "exports": {
     ".": "./index.js",

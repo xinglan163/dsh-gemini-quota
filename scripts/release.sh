@@ -4,6 +4,7 @@
 #   ./scripts/release.sh patch        # 0.1.2 → 0.1.3
 #   ./scripts/release.sh minor        # 0.1.2 → 0.2.0
 #   ./scripts/release.sh 1.0.0        # 指定版本号
+#   ./scripts/release.sh 0.2.0        # 指定版本号；若 package.json 已是 0.2.0 就跳过提版本那步
 #   DRY_RUN=1 ./scripts/release.sh patch   # 只走流程不发布（排练）
 #
 # 做的事：自测 → 提版本 → 提交 → 打 tag → 推 GitHub → npm publish（提示输 OTP）
@@ -37,7 +38,13 @@ node --check client.js
 node selftest.mjs
 
 echo "== 2. 提版本（${bump}）=="
-if [ "${dry}" = "1" ]; then
+current="$(node -p "require('./package.json').version")"
+if [ "${bump}" = "${current}" ]; then
+  # 版本号已经在功能提交里提过了（./scripts/release.sh 0.2.0 这种用法）。
+  # 此时 npm version 会因为"版本没变"直接报 Version not changed 并退出，所以跳过。
+  echo "  当前已是 ${current}，跳过提版本"
+  version="${current}"
+elif [ "${dry}" = "1" ]; then
   echo "  [dry-run] npm version ${bump} --no-git-tag-version"
   version="<新版本>"
 else
@@ -47,7 +54,13 @@ fi
 echo "  → ${version}"
 
 echo "== 3. 提交并推送 =="
-run git commit -am "chore: release ${version}"
+# 上面跳过了提版本，工作区就已经是干净的，硬跑 git commit 会因
+# "nothing to commit" 报错并让 set -e 中止整个发版。
+if [ -n "$(git status --porcelain)" ]; then
+  run git commit -am "chore: release ${version}"
+else
+  echo "  工作区已干净，无需提交"
+fi
 run git tag "v${version}"
 run git push origin main --tags
 
