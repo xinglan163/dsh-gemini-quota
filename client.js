@@ -4,7 +4,9 @@
 //   ✦  5h ████████░░░░░░  37%
 //      7d ██████████████  87%
 //   - 条 56×8（codex 是 48×6）；轨道用 color-mix 提亮；百分比直接写在条右侧；✦ 是 Gemini 标识；
-//   - 悬停给完整文案（剩余 / 重置时间 / 账号）。
+//   - 悬停给完整文案（剩余 / 重置时间 / 账号）；
+//   - 0.2.0：**点一下弹出多号池面板**——逐个账号看 5h/7d 剩余额度，并能启用/停用（冷却）、
+//     检测登录态、保活、切号，不用切去反代后台网页。
 //
 // **只在选中 Gemini 模型时显示**：判据与 dsh-codex-connect 的额度条同款——
 // 从 session 的 model-directory store 读当前选择（`state.current.{provider,model}`），
@@ -20,11 +22,15 @@ window.__ModuleLoader__.load({
     const React = require("react");
     const h = React.createElement;
 
-    const ROUTE = "/plugins/dsh-gemini-quota/quota";
+    const QUOTA_ROUTE = "/plugins/dsh-gemini-quota/quota";
+    const POOL_ROUTE = "/plugins/dsh-gemini-quota/pool";
+    const ACCOUNT_ROUTE = "/plugins/dsh-gemini-quota/account";
     const POLL_MS = 60000; // 服务端有 20s 缓存，60s 轮询足够且不打扰上游
     const MAX_BACKOFF_MS = 15 * 60000;
     const TRACK_W = 56;
     const TRACK_H = 8;
+    // 面板里的逐号额度查询是**按需**触发的，别一次把反代打爆。
+    const QUOTA_WORKERS = 3;
     // 兜底默认值。真正生效的范围由宿主半下发（浏览器半拿不到 cordis config），
     // 见 index.js 的 providers / matchModelPrefix。
     const DEFAULT_PROVIDERS = ["gemini-web"];
@@ -98,6 +104,16 @@ window.__ModuleLoader__.load({
       return sameDay ? `${hh}:${mm}` : `${d.getMonth() + 1}月${d.getDate()}日 ${hh}:${mm}`;
     }
 
+    /** 「多久以前」——面板里展示账号最近活动时间用。 */
+    function agoText(epochSec) {
+      if (typeof epochSec !== "number" || epochSec <= 0) return "从未";
+      const sec = Math.max(0, Math.floor(Date.now() / 1000) - epochSec);
+      if (sec < 60) return "刚刚";
+      if (sec < 3600) return `${Math.floor(sec / 60)} 分钟前`;
+      if (sec < 86400) return `${Math.floor(sec / 3600)} 小时前`;
+      return `${Math.floor(sec / 86400)} 天前`;
+    }
+
     /** 剩余量分档着色（比原来略亮一档，深色主题下更跳）。 */
     function colorOf(remain) {
       if (remain >= 60) return "var(--dsw-alias-state-success-primary, #34d399)";
@@ -106,9 +122,26 @@ window.__ModuleLoader__.load({
       return "var(--dsw-alias-state-error-primary, #f87171)";
     }
 
+    /** 账号健康度 → 颜色。判据同反代面板：dead=鉴权失败中，unknown=还没成功用过。 */
+    function healthColor(health) {
+      if (health === "dead") return "var(--dsw-alias-state-error-primary, #f87171)";
+      if (health === "disabled") return "var(--dsw-alias-state-idle-primary, #9aa3af)";
+      if (health === "unknown") return "var(--dsw-alias-state-warn-primary, #fbbf24)";
+      return "var(--dsw-alias-state-success-primary, #34d399)";
+    }
+
+    const HEALTH_TEXT = {
+      ok: "在用",
+      dead: "鉴权失败",
+      disabled: "已停用",
+      unknown: "待检测",
+    };
+
     /** 轨道底色：用 label-tertiary 混出半透明，浅/深主题都能看清。 */
     const TRACK_BG = "color-mix(in srgb, var(--dsw-alias-label-tertiary, #8b93a1) 42%, transparent)";
     const TRACK_RING = "color-mix(in srgb, var(--dsw-alias-label-tertiary, #8b93a1) 38%, transparent)";
+    const MUTED = "var(--dsw-alias-label-secondary, #6b7280)";
+    const PRIMARY = "var(--dsw-alias-label-primary, var(--dsw-alias-label-secondary, #f2f4f6))";
 
     function Row({ short, metric }) {
       const color = colorOf(metric.remainPercent);
@@ -125,8 +158,7 @@ window.__ModuleLoader__.load({
               width: 22,
               // label-primary 是主题里最亮的一档文字色（secondary/tertiary 都偏暗，
               // 深色主题下小字号几乎糊在背景里）。三级 fallback 保证任何主题下都可读。
-              color:
-                "var(--dsw-alias-label-primary, var(--dsw-alias-label-secondary, #f2f4f6))",
+              color: PRIMARY,
               fontSize: 11,
               lineHeight: "12px",
               fontWeight: 600,
@@ -180,6 +212,525 @@ window.__ModuleLoader__.load({
       );
     }
 
+    // ────────────────────────── 多号池面板 ──────────────────────────
+
+    /** 面板里的小进度条（比额度条窄，给「5h 37%」这种一行两档用）。 */
+    function MiniBar({ metric, width = 40 }) {
+      const color = colorOf(metric.remainPercent);
+      return h(
+        "span",
+        {
+          style: {
+            display: "inline-block",
+            width,
+            height: 6,
+            borderRadius: 999,
+            backgroundColor: "var(--dsw-alias-border-l2)",
+            background: TRACK_BG,
+            boxShadow: `inset 0 0 0 1px ${TRACK_RING}`,
+            overflow: "hidden",
+            verticalAlign: "middle",
+          },
+        },
+        h("span", {
+          style: {
+            display: "block",
+            width: `${clamp(metric.remainPercent)}%`,
+            height: "100%",
+            borderRadius: "inherit",
+            background: color,
+          },
+        }),
+      );
+    }
+
+    /** 一行「5h 37%」：短标签 + 迷你条 + 数字；没有数据时给 —。 */
+    function QuotaCell({ short, metric }) {
+      const has = metric && typeof metric.remainPercent === "number";
+      return h(
+        "span",
+        {
+          style: { display: "inline-flex", alignItems: "center", gap: 4 },
+          title: has ? `${short} 剩余 ${fmtPct(metric.remainPercent)}%（重置 ${resetText(metric.resetAt)}）` : undefined,
+        },
+        h("span", { style: { fontSize: 10, color: MUTED, fontWeight: 600 } }, short),
+        has ? h(MiniBar, { metric }) : null,
+        h(
+          "span",
+          {
+            style: {
+              fontSize: 11,
+              fontWeight: 700,
+              fontVariantNumeric: "tabular-nums",
+              color: has ? colorOf(metric.remainPercent) : MUTED,
+              minWidth: 30,
+              textAlign: "right",
+            },
+          },
+          has ? `${fmtPct(metric.remainPercent)}%` : "—",
+        ),
+      );
+    }
+
+    function SmallButton({ children, onClick, disabled, tone, title }) {
+      const color =
+        tone === "danger"
+          ? "var(--dsw-alias-state-error-primary, #f87171)"
+          : tone === "primary"
+            ? "var(--dsw-alias-brand-primary, #4f7cff)"
+            : MUTED;
+      return h(
+        "button",
+        {
+          type: "button",
+          onClick,
+          disabled,
+          title,
+          style: {
+            appearance: "none",
+            border: "1px solid var(--dsw-alias-border-l2, rgba(0,0,0,0.12))",
+            background: "transparent",
+            color,
+            fontSize: 11,
+            lineHeight: "16px",
+            padding: "2px 7px",
+            borderRadius: 6,
+            cursor: disabled ? "not-allowed" : "pointer",
+            opacity: disabled ? 0.45 : 1,
+            whiteSpace: "nowrap",
+            fontFamily: "inherit",
+          },
+        },
+        children,
+      );
+    }
+
+    function AccountRow({ account, quota, current, busy, canMutate, pendingSwitch, onAction }) {
+      const health = account.health;
+      const meta = [];
+      meta.push(account.proxyName ? `出口 ${account.proxyName}` : "出口 直连");
+      if (account.failCount > 0) meta.push(`失败 ${account.failCount} 次`);
+      meta.push(`${account.cookieCount} 个 cookie`);
+      if (account.lastOkAt > 0) meta.push(`上次成功 ${agoText(account.lastOkAt)}`);
+
+      return h(
+        "div",
+        {
+          style: {
+            display: "flex",
+            flexDirection: "column",
+            gap: 5,
+            padding: "7px 8px",
+            borderRadius: 8,
+            border: `1px solid ${
+              current ? "var(--dsw-alias-brand-primary, #4f7cff)" : "var(--dsw-alias-border-l1, rgba(0,0,0,0.06))"
+            }`,
+            background: current
+              ? "color-mix(in srgb, var(--dsw-alias-brand-primary, #4f7cff) 8%, transparent)"
+              : "transparent",
+          },
+        },
+        // 第一行：健康点 + 名字 + #id + 当前标记 … 5h / 7d
+        h(
+          "div",
+          { style: { display: "flex", alignItems: "center", gap: 6, minWidth: 0 } },
+          h("span", {
+            style: {
+              width: 7,
+              height: 7,
+              borderRadius: 999,
+              flex: "none",
+              background: healthColor(health),
+              boxShadow: `0 0 0 2px color-mix(in srgb, ${healthColor(health)} 22%, transparent)`,
+            },
+            title: HEALTH_TEXT[health] ?? health,
+          }),
+          h(
+            "span",
+            {
+              style: {
+                fontSize: 12,
+                fontWeight: 600,
+                color: PRIMARY,
+                whiteSpace: "nowrap",
+                overflow: "hidden",
+                textOverflow: "ellipsis",
+                maxWidth: 120,
+              },
+              title: account.label || `账号 #${account.id}`,
+            },
+            account.label || `账号 #${account.id}`,
+          ),
+          h("span", { style: { fontSize: 10, color: MUTED, flex: "none" } }, `#${account.id}`),
+          current
+            ? h(
+                "span",
+                {
+                  style: {
+                    fontSize: 10,
+                    fontWeight: 600,
+                    color: "var(--dsw-alias-brand-primary, #4f7cff)",
+                    border: "1px solid currentColor",
+                    borderRadius: 4,
+                    padding: "0 3px",
+                    flex: "none",
+                  },
+                },
+                "当前",
+              )
+            : null,
+          h("span", { style: { flex: 1, minWidth: 8 } }),
+          h(QuotaCell, { short: "5h", metric: quota?.state === "ok" ? quota.fiveHour : undefined }),
+          h(QuotaCell, { short: "7d", metric: quota?.state === "ok" ? quota.weekly : undefined }),
+        ),
+        // 第二行：元信息 + 操作按钮
+        h(
+          "div",
+          { style: { display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" } },
+          h(
+            "span",
+            {
+              style: {
+                fontSize: 10,
+                color: quota?.state === "error" ? "var(--dsw-alias-state-warn-primary, #fbbf24)" : MUTED,
+                flex: 1,
+                minWidth: 0,
+                overflow: "hidden",
+                textOverflow: "ellipsis",
+                whiteSpace: "nowrap",
+              },
+              title: quota?.state === "error" ? quota.error : account.lastError || meta.join(" · "),
+            },
+            quota?.state === "error" ? `额度读取失败：${quota.error}` : meta.join(" · "),
+          ),
+          canMutate
+            ? h(
+                "span",
+                { style: { display: "inline-flex", gap: 4, flex: "none" } },
+                h(
+                  SmallButton,
+                  {
+                    onClick: () => onAction("toggle", account),
+                    disabled: busy,
+                    title: account.status === "enabled" ? "停用这个号（冷却）" : "重新启用这个号",
+                  },
+                  account.status === "enabled" ? "停用" : "启用",
+                ),
+                h(
+                  SmallButton,
+                  {
+                    onClick: () => onAction("check", account),
+                    disabled: busy,
+                    title: "真的去上游探一次登录态",
+                  },
+                  "检测",
+                ),
+                h(
+                  SmallButton,
+                  {
+                    onClick: () => onAction("rotate", account),
+                    disabled: busy,
+                    title: "刷新 cookie 保活（SAPISID 轮换）",
+                  },
+                  "保活",
+                ),
+                h(
+                  SmallButton,
+                  {
+                    onClick: () => onAction("switch", account),
+                    disabled: busy || current === true,
+                    tone: pendingSwitch === account.id ? "danger" : "primary",
+                    title:
+                      "让接下来的请求都走这个号：启用它，并停用其它已启用的号（反代没有独立的\"活跃账号\"开关）",
+                  },
+                  pendingSwitch === account.id ? "确认切换" : "切到此号",
+                ),
+              )
+            : null,
+        ),
+      );
+    }
+
+    function PoolPanel({ currentAccountId, onClose, panelRef }) {
+      const [pool, setPool] = React.useState(undefined);
+      const [quotas, setQuotas] = React.useState({});
+      const [note, setNote] = React.useState(undefined);
+      const [busyId, setBusyId] = React.useState(0);
+      const [pendingSwitch, setPendingSwitch] = React.useState(0);
+      const [reload, setReload] = React.useState(0);
+
+      React.useEffect(() => {
+        let disposed = false;
+        const controller = new AbortController();
+
+        const patchQuota = (id, value) =>
+          setQuotas((prev) => ({ ...prev, [id]: value }));
+
+        const markRestUnsupported = () =>
+          setQuotas((prev) => {
+            const next = { ...prev };
+            for (const key of Object.keys(next)) {
+              if (next[key]?.state === "loading") next[key] = { state: "unsupported" };
+            }
+            return next;
+          });
+
+        // 逐号查额度：并发 QUOTA_WORKERS 个 worker 拉同一个队列。
+        // 一旦有一行返回 unsupported（反代没打按号查额度的补丁），立刻停手并把这些行标记出来，
+        // 免得白白打 N 次上游。
+        const loadQuotas = async (accounts) => {
+          const queue = accounts.map((a) => a.id);
+          let stopped = false;
+          const worker = async () => {
+            for (;;) {
+              if (disposed || stopped) return;
+              const id = queue.shift();
+              if (id === undefined) return;
+              let result;
+              try {
+                const res = await fetch(`${QUOTA_ROUTE}?account_id=${id}`, {
+                  method: "GET",
+                  credentials: "same-origin",
+                  headers: { accept: "application/json" },
+                  signal: controller.signal,
+                });
+                const value = res.ok ? await res.json().catch(() => undefined) : undefined;
+                if (value?.unsupported === true) {
+                  stopped = true;
+                  result = { state: "unsupported" };
+                } else if (value?.ok === true) {
+                  result = { state: "ok", fiveHour: value.fiveHour, weekly: value.weekly };
+                } else {
+                  result = { state: "error", error: value?.error ?? `HTTP ${res.status}` };
+                }
+              } catch (error) {
+                result = { state: "error", error: String(error?.message ?? error) };
+              }
+              if (disposed) return;
+              if (stopped) {
+                markRestUnsupported();
+                patchQuota(id, result);
+                return;
+              }
+              patchQuota(id, result);
+            }
+          };
+          await Promise.all(Array.from({ length: QUOTA_WORKERS }, worker));
+        };
+
+        const load = async () => {
+          setPool(undefined);
+          try {
+            const res = await fetch(POOL_ROUTE, {
+              method: "GET",
+              credentials: "same-origin",
+              headers: { accept: "application/json" },
+              signal: controller.signal,
+            });
+            const value = res.ok ? await res.json().catch(() => undefined) : undefined;
+            if (disposed) return;
+            if (value?.ok !== true) {
+              setPool({ error: value?.error ?? `HTTP ${res.status}` });
+              return;
+            }
+            setPool(value);
+            const initial = {};
+            for (const account of value.accounts ?? []) initial[account.id] = { state: "loading" };
+            setQuotas(initial);
+            await loadQuotas(value.accounts ?? []);
+          } catch (error) {
+            if (!disposed) setPool({ error: String(error?.message ?? error) });
+          }
+        };
+
+        load();
+        return () => {
+          disposed = true;
+          controller.abort();
+        };
+      }, [reload]);
+
+      const runAction = async (action, account) => {
+        // 「切到此号」会停用其它所有已启用的号，所以要点两次。
+        if (action === "switch" && pendingSwitch !== account.id) {
+          setPendingSwitch(account.id);
+          setNote({ kind: "info", text: `「切到此号」会启用 #${account.id} 并停用其它已启用的号，再点一次确认。` });
+          return;
+        }
+        setPendingSwitch(0);
+        setBusyId(account.id);
+        setNote(undefined);
+        try {
+          const res = await fetch(ACCOUNT_ROUTE, {
+            method: "POST",
+            credentials: "same-origin",
+            headers: { "content-type": "application/json", accept: "application/json" },
+            body: JSON.stringify({ action, id: account.id, ...(action === "switch" ? { confirm: true } : {}) }),
+          });
+          const value = await res.json().catch(() => undefined);
+          if (!res.ok || value?.ok !== true) {
+            setNote({ kind: "error", text: `${action} 失败：${value?.error ?? `HTTP ${res.status}`}` });
+            return;
+          }
+          if (action === "toggle") {
+            setNote({ kind: "ok", text: `#${account.id} 已${value.result?.status === "disabled" ? "停用" : "启用"}。` });
+          } else if (action === "check") {
+            setNote({
+              kind: value.result?.ok === true ? "ok" : "error",
+              text: `#${account.id} 检测：${value.result?.detail ?? "无结果"}${
+                typeof value.result?.took_ms === "number" ? `（${value.result.took_ms}ms）` : ""
+              }`,
+            });
+          } else if (action === "rotate") {
+            setNote({
+              kind: value.result?.ok === true ? "ok" : "error",
+              text: `#${account.id} 保活：${value.result?.detail ?? "无结果"}`,
+            });
+          } else if (action === "switch") {
+            const others = (value.changed ?? []).filter((c) => c.id !== account.id).length;
+            setNote({
+              kind: value.ok === true ? "ok" : "error",
+              text: `已切到 #${account.id}，停用其它 ${others} 个号${value.failed?.length ? `（${value.failed.length} 个失败）` : ""}。`,
+            });
+          }
+          setReload((n) => n + 1);
+        } catch (error) {
+          setNote({ kind: "error", text: `${action} 失败：${String(error?.message ?? error)}` });
+        } finally {
+          setBusyId(0);
+        }
+      };
+
+      const accounts = pool?.accounts ?? [];
+      const unsupported = Object.values(quotas).some((q) => q?.state === "unsupported");
+
+      const header = h(
+        "div",
+        { style: { display: "flex", alignItems: "center", gap: 6, marginBottom: 8 } },
+        h("span", { style: { fontSize: 12, fontWeight: 700, color: PRIMARY } }, "Gemini 账号池"),
+        pool?.ok === true
+          ? h("span", { style: { fontSize: 11, color: MUTED } }, `${pool.enabled}/${pool.total} 启用`)
+          : null,
+        h("span", { style: { flex: 1 } }),
+        h(SmallButton, { onClick: () => setReload((n) => n + 1), title: "重新读取账号池与额度" }, "刷新"),
+        pool?.panelUrl
+          ? h(
+              SmallButton,
+              {
+                onClick: () => window.open(pool.panelUrl, "_blank", "noopener"),
+                title: "打开反代自带的 web 面板（添加 cookie / 代理等）",
+              },
+              "反代面板",
+            )
+          : null,
+        onClose ? h(SmallButton, { onClick: onClose, title: "关闭" }, "✕") : null,
+      );
+
+      let body;
+      if (pool === undefined) {
+        body = h("div", { style: { fontSize: 11, color: MUTED, padding: "6px 2px" } }, "读取账号池…");
+      } else if (pool.error !== undefined) {
+        body = h(
+          "div",
+          { style: { fontSize: 11, color: "var(--dsw-alias-state-error-primary, #f87171)", padding: "6px 2px" } },
+          `读取失败：${pool.error}`,
+        );
+      } else if (accounts.length === 0) {
+        body = h(
+          "div",
+          { style: { fontSize: 11, color: MUTED, padding: "6px 2px", lineHeight: "16px" } },
+          "池里还没有账号。额度是账号级的——先去反代面板的 Cookie 池挂一个 Google 登录态。",
+        );
+      } else {
+        body = h(
+          "div",
+          { style: { display: "flex", flexDirection: "column", gap: 5 } },
+          accounts.map((account) =>
+            h(AccountRow, {
+              key: account.id,
+              account,
+              quota: quotas[account.id],
+              current: currentAccountId !== undefined && currentAccountId === account.id,
+              busy: busyId === account.id,
+              canMutate: pool.canMutate !== false,
+              pendingSwitch,
+              onAction: runAction,
+            }),
+          ),
+        );
+      }
+
+      const footer = [];
+      if (unsupported) {
+        footer.push(
+          h(
+            "div",
+            { key: "unsupported", style: { fontSize: 10, color: MUTED, lineHeight: "14px", marginTop: 8 } },
+            "你的反代还没支持「按账号查额度」（缺少 /admin/api/quota?account_id=N）。账号状态仍可操作；要逐号看额度，见 README「多路账号池」。",
+          ),
+        );
+      }
+      if (note) {
+        footer.push(
+          h(
+            "div",
+            {
+              key: "note",
+              style: {
+                fontSize: 11,
+                lineHeight: "15px",
+                marginTop: 8,
+                color:
+                  note.kind === "error"
+                    ? "var(--dsw-alias-state-error-primary, #f87171)"
+                    : note.kind === "ok"
+                      ? "var(--dsw-alias-state-success-primary, #34d399)"
+                      : MUTED,
+              },
+            },
+            note.text,
+          ),
+        );
+      }
+
+      return h(
+        "div",
+        {
+          ref: panelRef,
+          role: "dialog",
+          "aria-label": "Gemini 账号池",
+          // 面板是额度条的**子节点**（这样鼠标移进来不会触发 wrapper 的 mouseleave，浮层不闪），
+          // 所以面板里的点击会冒泡到额度条自己的 onClick —— 那会把面板当场关掉。这里截断。
+          onClick: (event) => event.stopPropagation(),
+          // 面板在额度条的父节点里，鼠标移进来不会触发 wrapper 的 mouseleave，所以浮层不会闪。
+          style: {
+            position: "absolute",
+            bottom: "calc(100% + 8px)",
+            right: 0,
+            zIndex: 1200,
+            width: "min(92vw, 360px)",
+            maxHeight: "min(62vh, 480px)",
+            overflowY: "auto",
+            pointerEvents: "auto",
+            textAlign: "left",
+            padding: 10,
+            borderRadius: "var(--dsw-radius-md, 12px)",
+            background:
+              "var(--dsw-specific-menu, var(--dsw-alias-bg-overlay, var(--dsw-alias-bg-layer-2, #ffffff)))",
+            backdropFilter: "var(--dsw-menu-backdrop-filter, blur(20px))",
+            WebkitBackdropFilter: "var(--dsw-menu-backdrop-filter, blur(20px))",
+            color: PRIMARY,
+            border: "1px solid var(--dsw-alias-border-l1, rgba(0,0,0,0.08))",
+            boxShadow: "var(--dsw-elevation-soft, var(--dsw-shadow-lv2, 0 8px 24px rgba(0,0,0,0.14)))",
+            fontFamily: "inherit",
+          },
+        },
+        header,
+        body,
+        ...footer,
+      );
+    }
+
     function GeminiQuotaPill({ directory }) {
       // 当前选中的模型（session 级）。codex 的额度条/fast-mode 开关用的是同一个 store。
       // directory 缺失（inject 没给到）时也不能抛：抛了会被 SlotErrorBoundary 干掉整条 entry。
@@ -191,6 +742,8 @@ window.__ModuleLoader__.load({
       const [snapshot, setSnapshot] = React.useState(undefined);
       const [scope, setScope] = React.useState(undefined); // { providers, matchModelPrefix }
       const [tip, setTip] = React.useState(false);
+      const [open, setOpen] = React.useState(false);
+      const wrapRef = React.useRef(null);
 
       const eligible = scope !== undefined && matchesScope(directoryState, scope);
       const scopeRef = React.useRef(undefined);
@@ -206,7 +759,7 @@ window.__ModuleLoader__.load({
         const load = async () => {
           let value;
           try {
-            const res = await fetch(ROUTE, {
+            const res = await fetch(QUOTA_ROUTE, {
               method: "GET",
               credentials: "same-origin",
               headers: { accept: "application/json" },
@@ -266,7 +819,7 @@ window.__ModuleLoader__.load({
         const refresh = async () => {
           if (disposed || document.hidden) return;
           try {
-            const res = await fetch(ROUTE, {
+            const res = await fetch(QUOTA_ROUTE, {
               method: "GET",
               credentials: "same-origin",
               headers: { accept: "application/json" },
@@ -294,6 +847,23 @@ window.__ModuleLoader__.load({
           controller.abort();
         };
       }, [eligible]);
+
+      // 面板打开时：点外面 / 按 Esc 关掉。
+      React.useEffect(() => {
+        if (!open) return undefined;
+        const onPointerDown = (event) => {
+          if (wrapRef.current && !wrapRef.current.contains(event.target)) setOpen(false);
+        };
+        const onKeyDown = (event) => {
+          if (event.key === "Escape") setOpen(false);
+        };
+        document.addEventListener("mousedown", onPointerDown, true);
+        document.addEventListener("keydown", onKeyDown);
+        return () => {
+          document.removeEventListener("mousedown", onPointerDown, true);
+          document.removeEventListener("keydown", onKeyDown);
+        };
+      }, [open]);
 
       // 非 Gemini 模型 / 加载中 / 取数失败 → 整条隐藏（不显示 0%，避免误导）
       if (!eligible || snapshot === undefined) return null;
@@ -335,15 +905,28 @@ window.__ModuleLoader__.load({
         `${r.short} 重置：${r.resetLabel}`,
       ]);
       if (snapshot.account) tipLines.push(`账号：${snapshot.account}`);
+      tipLines.push("点一下：账号池面板");
 
       return h(
         "span",
         {
+          ref: wrapRef,
           role: "status",
           "data-gemini-quota": rows.map((r) => r.kind).join(","),
           "aria-label": label,
+          "aria-expanded": open,
           // 刻意不设 title：原生提示无法定制样式，会和自绘 tooltip 叠成两个。
           tabIndex: 0,
+          onClick: () => setOpen((v) => !v),
+          onKeyDown: (event) => {
+            // 面板里的按键不要被这里接管（否则在面板里按空格/回车会顺手把面板关掉，
+            // 而且会抢掉 Esc 关面板的 document 监听）。
+            if (event.target !== event.currentTarget) return;
+            if (event.key === "Enter" || event.key === " ") {
+              event.preventDefault();
+              setOpen((v) => !v);
+            }
+          },
           onMouseEnter: () => setTip(true),
           onMouseLeave: () => setTip(false),
           onFocus: () => setTip(true),
@@ -354,6 +937,7 @@ window.__ModuleLoader__.load({
             alignItems: "center",
             gap: 6,
             padding: "1px 2px",
+            cursor: "pointer",
           },
         },
         // Gemini 官方 logo（内联 SVG，渐变填色），替代原来的 ✦ 星形字符
@@ -370,7 +954,7 @@ window.__ModuleLoader__.load({
           },
           rows.map((r) => h(Row, { key: r.kind, short: r.short, metric: r.metric })),
         ),
-        tip
+        tip && !open
           ? h(
               "span",
               {
@@ -404,6 +988,12 @@ window.__ModuleLoader__.load({
               },
               tipLines.map((text, i) => h("div", { key: i }, text)),
             )
+          : null,
+        open
+          ? h(PoolPanel, {
+              currentAccountId: snapshot.accountId,
+              onClose: () => setOpen(false),
+            })
           : null,
       );
     }

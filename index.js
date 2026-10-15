@@ -1,11 +1,17 @@
 // dsh-gemini-quota —— 宿主半
 //
-// 只做一件事：把本地 gemini-web2api-go 反代的 /admin/api/quota 转成同源路由
+// 0.1.x 只做一件事：把本地 gemini-web2api-go 反代的 /admin/api/quota 转成同源路由
 // /plugins/dsh-gemini-quota/quota 给浏览器半用。
+//
+// 0.2.0 起多了「多号池面板」：额度条点一下弹出账号列表，逐号看 5h/7d 剩余额度，
+// 并且能直接在 DSH 里 启用/停用（冷却）、检测登录态、保活、切号——不用切去反代后台网页。
+// 新增两条同源路由：
+//   GET  /plugins/dsh-gemini-quota/pool     账号池状态（读 /admin/api/cookies）
+//   POST /plugins/dsh-gemini-quota/account  账号动作（toggle / check / rotate / switch）
 //
 // 为什么必须由宿主代理（不能浏览器直连 8083）：
 //   gemini-web2api 的 writeJSON 会设 Access-Control-Allow-Origin: *，但**不设**
-//   Access-Control-Allow-Headers / -Methods，/admin/api/quota 也没有 OPTIONS 分支
+//   Access-Control-Allow-Headers / -Methods，/admin/api/* 也没有 OPTIONS 分支
 //   （internal/app/app.go、server.go）。浏览器带 Authorization 头去 fetch 会触发
 //   预检，预检落到 requireAuth 返回 401 且缺 Allow-Headers → 被浏览器拒绝。
 //   退一步用 ?token= 能过（简单请求），但会把 admin token 写进前端产物，不可接受。
@@ -25,6 +31,7 @@
 //                      未配置时兜底读 $DSH_HOME/gemini-web2api.env（默认 ~/.dsh/）——
 //                      机器相关的东西放 DSH home，包里不留任何绝对路径。
 //   timeoutMs          上游超时，默认 8000
+//   readOnly           true 时禁用 POST /account（只看不动），默认 false
 //
 // providers / matchModelPrefix 会随响应下发给浏览器半——浏览器半拿不到 cordis config
 // （client-modules 只传 { name: id }），所以判定范围必须由宿主告知。
@@ -34,10 +41,15 @@ import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-const ROUTE = "/plugins/dsh-gemini-quota/quota";
+const QUOTA_ROUTE = "/plugins/dsh-gemini-quota/quota";
+const POOL_ROUTE = "/plugins/dsh-gemini-quota/pool";
+const ACCOUNT_ROUTE = "/plugins/dsh-gemini-quota/account";
 const DEFAULT_BASE_URL = "http://127.0.0.1:8083";
 const DEFAULT_TOKEN_ENV = "GEMINI_WEB_ADMIN_TOKEN";
 const DEFAULT_PROVIDERS = ["gemini-web"];
+const MAX_BODY_BYTES = 4096;
+// 面板一次最多操作多少个账号（切号会遍历整个池；设个上限防止池子异常大时把上游打爆）。
+const MAX_ACCOUNTS = 100;
 
 /** 配置里既接受数组也接受 "a,b c" 这种字符串；空则退回默认值。 */
 function asStringList(value, fallback) {
@@ -76,7 +88,6 @@ function defaultEnvFile() {
 }
 
 /** admin token 解析链：config.token → 环境变量 → config.envFile → $DSH_HOME/gemini-web2api.env。 */
-
 function resolveToken(config) {
   const direct = typeof config.token === "string" ? config.token.trim() : "";
   if (direct !== "") return direct;
@@ -94,38 +105,88 @@ function resolveToken(config) {
   return readEnvFileToken(defaultEnvFile());
 }
 
-/** 用 node:http 而不是全局 fetch：宿主里可能存在全局 proxy dispatcher，会劫持回环请求。 */
-function getJson(url, token, timeoutMs) {
+function baseUrlOf(config) {
+  return String(config.baseUrl ?? DEFAULT_BASE_URL).replace(/\/+$/u, "");
+}
+
+/**
+ * 用 node:http 而不是全局 fetch：宿主里可能存在全局 proxy dispatcher，会劫持回环请求。
+ * body 给了就发 JSON POST（反代的账号动作接口全是 POST）。
+ */
+function httpJson(url, { method = "GET", token, body, timeoutMs = 8000 } = {}) {
   return new Promise((resolve, reject) => {
     const target = new URL(url);
+    const payload = body === undefined ? undefined : Buffer.from(JSON.stringify(body), "utf8");
+    const headers = { accept: "application/json", authorization: `Bearer ${token}` };
+    if (payload !== undefined) {
+      headers["content-type"] = "application/json";
+      headers["content-length"] = String(payload.length);
+    }
     const req = request(
       {
         protocol: target.protocol,
         hostname: target.hostname,
         port: target.port,
         path: `${target.pathname}${target.search}`,
-        method: "GET",
-        headers: { accept: "application/json", authorization: `Bearer ${token}` },
+        method,
+        headers,
       },
       (res) => {
         const chunks = [];
         res.on("data", (chunk) => chunks.push(chunk));
         res.on("end", () => {
-          if (res.statusCode !== 200) {
-            reject(new Error(`quota upstream ${res.statusCode}`));
+          const text = Buffer.concat(chunks).toString("utf8");
+          if (res.statusCode < 200 || res.statusCode >= 300) {
+            reject(new Error(`upstream ${res.statusCode}`));
+            return;
+          }
+          if (text.trim() === "") {
+            resolve({});
             return;
           }
           try {
-            resolve(JSON.parse(Buffer.concat(chunks).toString("utf8")));
+            resolve(JSON.parse(text));
           } catch (error) {
             reject(error);
           }
         });
       },
     );
-    req.setTimeout(timeoutMs, () => req.destroy(new Error("quota upstream timeout")));
+    req.setTimeout(timeoutMs, () => req.destroy(new Error("upstream timeout")));
     req.on("error", reject);
+    if (payload !== undefined) req.write(payload);
     req.end();
+  });
+}
+
+/** 读请求体（限长），返回解析后的 JSON 对象。 */
+function readJsonBody(req) {
+  return new Promise((resolve, reject) => {
+    let size = 0;
+    const chunks = [];
+    req.on("data", (chunk) => {
+      size += chunk.length;
+      if (size > MAX_BODY_BYTES) {
+        reject(new Error("body too large"));
+        req.destroy?.();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on("end", () => {
+      const text = Buffer.concat(chunks).toString("utf8").trim();
+      if (text === "") {
+        resolve({});
+        return;
+      }
+      try {
+        const parsed = JSON.parse(text);
+        resolve(parsed !== null && typeof parsed === "object" ? parsed : {});
+      } catch (error) {
+        reject(error);
+      }
+    });
+    req.on("error", reject);
   });
 }
 
@@ -155,58 +216,251 @@ const metric = (m) =>
         resetInSec: m.reset_in_sec,
       };
 
+/** 反代 /admin/api/cookies 的一条 item → 面板用的紧凑视图（字段名保持上游语义）。 */
+function accountView(raw) {
+  return {
+    id: Number(raw.id ?? 0),
+    label: String(raw.label ?? ""),
+    status: raw.status === "disabled" ? "disabled" : "enabled",
+    health: typeof raw.health === "string" ? raw.health : "unknown",
+    note: String(raw.note ?? ""),
+    failCount: Number(raw.fail_count ?? 0),
+    lastUsedAt: Number(raw.last_used_at ?? 0),
+    lastOkAt: Number(raw.last_ok_at ?? 0),
+    lastError: String(raw.last_error ?? ""),
+    cookieCount: Number(raw.cookie_count ?? 0),
+    keyCookies: Array.isArray(raw.key_cookies) ? raw.key_cookies.map(String) : [],
+    sapisidTail: String(raw.sapisid_tail ?? ""),
+    has1psidts: raw.has_1psidts === true,
+    proxyId: Number(raw.proxy_id ?? 0),
+    proxyName: String(raw.proxy_name ?? ""),
+  };
+}
+
+/** 从 req.url 里取查询串（自测的假 req 可能没有 url）。 */
+function queryOf(req) {
+  const url = typeof req.url === "string" ? req.url : "";
+  const at = url.indexOf("?");
+  return new URLSearchParams(at >= 0 ? url.slice(at + 1) : "");
+}
+
 export function apply(ctx, config = {}) {
   const providers = asStringList(config.providers, DEFAULT_PROVIDERS);
   const matchModelPrefix = config.matchModelPrefix !== false;
+  const readOnly = config.readOnly === true;
   // scope 每次响应都带上：反代挂了也要能让浏览器半知道"该不该显示"，否则门控会失忆。
   const scope = { providers, matchModelPrefix };
 
   ctx.inject(["webServer"], (webCtx) => {
     // token 在每次请求时解析：用户改了环境变量 / .env 不必重启宿主。
     const token = () => resolveToken(config);
+    const timeoutMs = () => config.timeoutMs ?? 8000;
 
-    webCtx.effect(
-      () =>
-        webCtx.webServer.register({
-          kind: "exact",
-          path: ROUTE,
-          handler: async (req, res) => {
-            const json = (status, value) => {
-              res.writeHead(status, {
-                "content-type": "application/json; charset=utf-8",
-                "cache-control": "no-store",
-                "x-content-type-options": "nosniff",
-              });
-              res.end(JSON.stringify({ ...scope, ...value }));
-            };
-            if (req.method !== "GET") return json(405, { error: "method not allowed" });
-            if (!isTrusted(req)) return json(403, { error: "forbidden" });
+    const register = (path, label, handler) =>
+      webCtx.effect(
+        () => webCtx.webServer.register({ kind: "exact", path, handler }),
+        `dsh-gemini-quota: ${label}`,
+      );
 
-            const adminToken = token();
-            if (adminToken === undefined) return json(503, { error: "no admin token" });
+    /** 统一出参：所有响应都带 scope，前端门控不会因为一次报错失忆。 */
+    const makeJson = (res) => (status, value) => {
+      res.writeHead(status, {
+        "content-type": "application/json; charset=utf-8",
+        "cache-control": "no-store",
+        "x-content-type-options": "nosniff",
+      });
+      res.end(JSON.stringify({ ...scope, ...value }));
+    };
 
-            try {
-              const base = String(config.baseUrl ?? DEFAULT_BASE_URL).replace(/\/+$/u, "");
-              const snap = await getJson(
-                `${base}/admin/api/quota`,
-                adminToken,
-                config.timeoutMs ?? 8000,
-              );
-              return json(200, {
-                ok: snap.ok === true,
-                account: snap.account,
-                cached: snap.cached === true,
-                fetchedAt: snap.fetched_at,
-                fiveHour: metric(snap.five_hour),
-                weekly: metric(snap.weekly),
-                ...(snap.ok === true ? {} : { error: snap.error ?? "quota unavailable" }),
-              });
-            } catch (error) {
-              return json(502, { ok: false, error: String(error?.message ?? error) });
-            }
-          },
-        }),
-      "dsh-gemini-quota: quota route",
-    );
+    /** 每个 handler 开头都过一遍的闸门：方法 + 信任 + token。返回 undefined 表示已放行。 */
+    const guard = (req, res, json, allowedMethod) => {
+      if (req.method !== allowedMethod) {
+        json(405, { error: "method not allowed" });
+        return true;
+      }
+      if (!isTrusted(req)) {
+        json(403, { error: "forbidden" });
+        return true;
+      }
+      if (token() === undefined) {
+        json(503, { error: "no admin token" });
+        return true;
+      }
+      return false;
+    };
+
+    // ── GET /quota：额度（自动选号，或被 ?account_id=N 指定账号）──
+    register(QUOTA_ROUTE, "quota route", async (req, res) => {
+      const json = makeJson(res);
+      if (guard(req, res, json, "GET")) return;
+
+      const query = queryOf(req);
+      const rawAccount = (query.get("account_id") ?? "").trim();
+      let accountId;
+      if (rawAccount !== "") {
+        if (!/^\d+$/u.test(rawAccount)) {
+          json(400, { ok: false, error: "bad account_id" });
+          return;
+        }
+        accountId = Number(rawAccount);
+        if (!Number.isSafeInteger(accountId) || accountId <= 0) {
+          json(400, { ok: false, error: "bad account_id" });
+          return;
+        }
+      }
+
+      const search = new URLSearchParams();
+      if (accountId !== undefined) search.set("account_id", String(accountId));
+      if (query.get("refresh") === "1") search.set("refresh", "1");
+      const suffix = search.toString() === "" ? "" : `?${search.toString()}`;
+
+      try {
+        const snap = await httpJson(`${baseUrlOf(config)}/admin/api/quota${suffix}`, {
+          token: token(),
+          timeoutMs: timeoutMs(),
+        });
+
+        // 按号查额度是本地的扩展接口。上游若没有这段逻辑，会原样返回「自动选号」的结果——
+        // 那就必须用 account_id 对不上来识别，绝不能把别人的数字挂到这个账号名下。
+        if (
+          accountId !== undefined &&
+          (snap.ok !== true || Number(snap.account_id ?? 0) !== accountId)
+        ) {
+          json(200, {
+            ok: false,
+            unsupported: true,
+            accountId,
+            error:
+              snap.error ??
+              "上游不支持按账号查额度：需要带 /admin/api/quota?account_id=N 的反代（见 README「多号池面板」）",
+          });
+          return;
+        }
+
+        json(200, {
+          ok: snap.ok === true,
+          accountId: Number(snap.account_id ?? 0) || undefined,
+          account: snap.account,
+          direct: snap.direct === true,
+          proxy: snap.proxy,
+          cached: snap.cached === true,
+          fetchedAt: snap.fetched_at,
+          fiveHour: metric(snap.five_hour),
+          weekly: metric(snap.weekly),
+          ...(snap.ok === true ? {} : { error: snap.error ?? "quota unavailable" }),
+        });
+      } catch (error) {
+        json(502, { ok: false, error: String(error?.message ?? error) });
+      }
+    });
+
+    // ── GET /pool：账号池状态 ──
+    register(POOL_ROUTE, "pool route", async (req, res) => {
+      const json = makeJson(res);
+      if (guard(req, res, json, "GET")) return;
+
+      try {
+        const upstream = await httpJson(`${baseUrlOf(config)}/admin/api/cookies`, {
+          token: token(),
+          timeoutMs: timeoutMs(),
+        });
+        const items = Array.isArray(upstream.items) ? upstream.items : [];
+        const accounts = items.slice(0, MAX_ACCOUNTS).map(accountView);
+        json(200, {
+          ok: true,
+          fetchedAt: Math.floor(Date.now() / 1000),
+          total: Number(upstream.total ?? accounts.length),
+          enabled: Number(upstream.enabled ?? accounts.filter((a) => a.status === "enabled").length),
+          truncated: items.length > accounts.length,
+          canMutate: !readOnly,
+          // 面板里「打开反代后台」按钮用。回环地址，不算敏感信息。
+          panelUrl: `${baseUrlOf(config)}/admin/`,
+          accounts,
+        });
+      } catch (error) {
+        json(502, { ok: false, error: String(error?.message ?? error) });
+      }
+    });
+
+    // ── POST /account：账号动作 ──
+    register(ACCOUNT_ROUTE, "account route", async (req, res) => {
+      const json = makeJson(res);
+      if (guard(req, res, json, "POST")) return;
+      if (readOnly) {
+        json(403, { ok: false, error: "readOnly: 宿主配置禁用了账号动作" });
+        return;
+      }
+
+      let body;
+      try {
+        body = await readJsonBody(req);
+      } catch (error) {
+        json(400, { ok: false, error: String(error?.message ?? error) });
+        return;
+      }
+
+      const action = typeof body.action === "string" ? body.action.trim() : "";
+      const id = Number(body.id ?? 0);
+      if (!["toggle", "check", "rotate", "switch"].includes(action)) {
+        json(400, { ok: false, error: "unknown action" });
+        return;
+      }
+      if (!Number.isSafeInteger(id) || id <= 0) {
+        json(400, { ok: false, error: "bad id" });
+        return;
+      }
+
+      const base = baseUrlOf(config);
+      const call = (path, options = {}) =>
+        httpJson(`${base}${path}`, { token: token(), timeoutMs: timeoutMs(), ...options });
+
+      try {
+        if (action === "toggle" || action === "check" || action === "rotate") {
+          const path = `/admin/api/cookies/${id}/${action}`;
+          // 反代三个动作都是 POST；check / rotate 的结果体原样透传给面板展示。
+          const result = await call(path, { method: "POST", body: {} });
+          json(200, { ok: true, action, id, result });
+          return;
+        }
+
+        // ── switch：切号 = 启用目标号 + 停用其余已启用的号 ──
+        // 反代的调度器只按 (fail_count, last_used_at) 轮转，没有「活跃账号」这个开关，
+        // 所以"让接下来的请求都走这个号"唯一诚实的实现就是把别的号禁用掉。
+        // 这是会改动多行状态的动作，必须显式 confirm。
+        if (body.confirm !== true) {
+          json(400, { ok: false, error: "switch 需要 confirm:true" });
+          return;
+        }
+        const upstream = await call("/admin/api/cookies");
+        const items = (Array.isArray(upstream.items) ? upstream.items : []).slice(0, MAX_ACCOUNTS);
+        const target = items.find((a) => Number(a.id) === id);
+        if (target === undefined) {
+          json(404, { ok: false, error: `account #${id} not found` });
+          return;
+        }
+
+        const changed = [];
+        const failed = [];
+        const toggle = async (accountId) => {
+          try {
+            const r = await call(`/admin/api/cookies/${accountId}/toggle`, {
+              method: "POST",
+              body: {},
+            });
+            changed.push({ id: accountId, status: r.status });
+          } catch (error) {
+            failed.push({ id: accountId, error: String(error?.message ?? error) });
+          }
+        };
+
+        if (target.status !== "enabled") await toggle(id);
+        for (const account of items) {
+          if (Number(account.id) !== id && account.status === "enabled") await toggle(Number(account.id));
+        }
+        json(200, { ok: failed.length === 0, action, id, changed, failed });
+      } catch (error) {
+        json(502, { ok: false, error: String(error?.message ?? error) });
+      }
+    });
   });
 }

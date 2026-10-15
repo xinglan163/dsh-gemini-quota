@@ -9,10 +9,13 @@ DSH 的插件页没有独立商店后端：它就是把包名交给 `pnpm add`�
 ```sh
 cd plugins/dsh-gemini-quota
 node --check index.js && node --check client.js
-node selftest.mjs                 # 宿主半单测（不起 App）
+node selftest.mjs                 # 宿主半单测（不起 App）+ 浏览器半模块契约冒烟
+node scripts/http-check.mjs       # 真起一个 http server，用真 fetch 打一遍三条路由
 npx --yes publint                 # 可选：清单/导出体检
 npm pack --dry-run                # 看最终 tarball 里到底有什么
 ```
+
+> 这两个自测都**只读**：账号动作只走会被入参校验挡下的分支，不会真的停用你正在用的号。
 
 必须满足（来自 DSH plugin-manager 的安装前检查）：
 
@@ -21,7 +24,10 @@ npm pack --dry-run                # 看最终 tarball 里到底有什么
 - [ ] **无 `private: true`**；
 - [ ] `files` 里包含运行时需要的全部文件；
 - [ ] 没有 `postinstall`/`prepare` 等依赖构建脚本（否则用户要额外批准 `allowBuilds`）；
-- [ ] 包内**不出现任何机器专属绝对路径**。
+- [ ] 包内**不出现任何机器专属绝对路径**；
+- [ ] 0.2.0 起契约变宽了：除 `/admin/api/quota` 外还依赖 `/admin/api/cookies`（上游已有）
+      和可选的 `?account_id=N`。发布前用 `node scripts/http-check.mjs` 确认三条路由都通，
+      并在 README 里如实标注「没有补丁时会怎样」。
 
 ## 1. 仓库地址
 

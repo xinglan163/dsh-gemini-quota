@@ -17,7 +17,7 @@
 ### ① 仓库描述（≤350 字符）
 
 ```
-为 DeepSeek Harness 添加 Gemini 网页端额度条：在输入框的模型切换器左侧显示 5 小时 / 每周剩余额度，只在选中 Gemini 模型时出现。数据来自本地 gemini-web2api-go 反代。· Gemini quota pill for DeepSeek Harness.
+为 DeepSeek Harness 添加 Gemini 额度条：在输入框显示 5 小时 / 每周剩余额度，只在选中 Gemini 模型时出现；点开即多号池面板，可逐号看额度、启停冷却、检测保活、一键切号。数据来自本地 gemini-web2api-go 反代。· Gemini quota pill + account pool panel for DeepSeek Harness.
 ```
 
 （可与 `package.json` 的 `description` 保持一致，见第 4 节。）
@@ -56,5 +56,5 @@ npm publish --access public
 如需让 npm 页描述与仓库描述一致：
 
 ```sh
-npm pkg set description="为 DeepSeek Harness 添加 Gemini 网页端额度条：在输入框的模型切换器左侧显示 5 小时 / 每周剩余额度，只在选中 Gemini 模型时出现。数据来自本地 gemini-web2api-go 反代。"
+npm pkg set description="在 DeepSeek Harness 输入框显示 Gemini 额度条，点开即多号池面板：逐号剩余额度、启停冷却、检测保活、一键切号"
 ```

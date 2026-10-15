@@ -20,3 +20,5 @@
         tokenEnv: GEMINI_WEB_ADMIN_TOKEN
         # envFile: /path/to/gemini-web2api/.env
         timeoutMs: 8000
+        # true = 面板只读（禁用 /account 的启停/检测/保活/切号），默认 false
+        readOnly: false
