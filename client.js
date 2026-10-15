@@ -450,7 +450,7 @@ window.__ModuleLoader__.load({
       );
     }
 
-    function PoolPanel({ currentAccountId, actual, onClose, panelRef }) {
+    function PoolPanel({ currentAccountId, actual, onClose, onRefresh, panelRef }) {
       const [pool, setPool] = React.useState(undefined);
       const [quotas, setQuotas] = React.useState({});
       const [note, setNote] = React.useState(undefined);
@@ -593,6 +593,8 @@ window.__ModuleLoader__.load({
             });
           }
           setReload((n) => n + 1);
+          // 动了账号（切换 / 启停）→ 额度条立刻跟上，别等下一个轮询周期
+          if (onRefresh) onRefresh();
         } catch (error) {
           setNote({ kind: "error", text: `${action} 失败：${String(error?.message ?? error)}` });
         } finally {
@@ -673,7 +675,7 @@ window.__ModuleLoader__.load({
           ? h("span", { style: { fontSize: 11, color: MUTED } }, `${pool.enabled}/${pool.total} 启用`)
           : null,
         h("span", { style: { flex: 1 } }),
-        h(SmallButton, { onClick: () => setReload((n) => n + 1), title: "重新读取账号池与额度" }, "刷新"),
+        h(SmallButton, { onClick: () => { setReload((n) => n + 1); if (onRefresh) onRefresh(); }, title: "重新读取账号池与额度" }, "刷新"),
         pool?.panelUrl
           ? h(
               SmallButton,
@@ -807,6 +809,12 @@ window.__ModuleLoader__.load({
       const [tip, setTip] = React.useState(false);
       const [open, setOpen] = React.useState(false);
       const wrapRef = React.useRef(null);
+      // 最近一次**真正在服务**的账号（取自 /actual 的最后一条请求）。额度条跟着它走：
+      // /quota 不带参数时反代报的是"下一个会用的号"，而开了额度感知选号之后请求会在号
+      // 之间改道 —— 两者经常不是同一个，UI 就会一直显示另一个号（实测踩到）。
+      const servingRef = React.useRef(0);
+      const askedRef = React.useRef(0); // 上次额度请求问的是哪个号，避免重复触发
+      const refreshRef = React.useRef(null); // 给面板动作用：动作后立刻刷一次额度
 
       const eligible = scope !== undefined && matchesScope(directoryState, scope);
       const scopeRef = React.useRef(undefined);
@@ -882,7 +890,11 @@ window.__ModuleLoader__.load({
         const refresh = async () => {
           if (disposed || document.hidden) return;
           try {
-            const res = await fetch(QUOTA_ROUTE, {
+            // 按号查而不是让反代自己挑：要显示的是"正在服务你的那个号"的额度。
+            const serving = servingRef.current;
+            askedRef.current = serving;
+            const target = serving > 0 ? `${QUOTA_ROUTE}?account_id=${serving}` : QUOTA_ROUTE;
+            const res = await fetch(target, {
               method: "GET",
               credentials: "same-origin",
               headers: { accept: "application/json" },
@@ -900,6 +912,7 @@ window.__ModuleLoader__.load({
             schedule();
           }
         };
+        refreshRef.current = refresh;
 
         // 降级守卫与额度同一节奏刷。它失败一律当"不知道"（不亮红灯）——
         // 旧宿主半没有这条路由时只是 404，绝不能影响额度条本身。
@@ -913,6 +926,13 @@ window.__ModuleLoader__.load({
             });
             const value = res.ok ? await res.json().catch(() => undefined) : undefined;
             if (!disposed) setActual(value?.ok === true ? value : undefined);
+            // 服务你的号换了 → 额度立刻跟上，不等下一个 60 秒周期
+            //（"账号切了但 UI 没切"的第二个来源就是轮询间隔）。
+            const serving = Number(value?.latest?.accountId ?? 0) || 0;
+            if (!disposed && serving > 0 && serving !== servingRef.current) {
+              servingRef.current = serving;
+              if (serving !== askedRef.current) refresh();
+            }
           } catch {
             if (!disposed) setActual(undefined);
           }
@@ -925,6 +945,7 @@ window.__ModuleLoader__.load({
         document.addEventListener("visibilitychange", schedule);
         return () => {
           disposed = true;
+          refreshRef.current = null;
           document.removeEventListener("visibilitychange", schedule);
           if (timer !== undefined) window.clearTimeout(timer);
           controller.abort();
@@ -1115,6 +1136,9 @@ window.__ModuleLoader__.load({
               currentAccountId: snapshot.accountId,
               actual,
               onClose: () => setOpen(false),
+              onRefresh: () => {
+                if (refreshRef.current) refreshRef.current();
+              },
             })
           : null,
       );
