@@ -1,6 +1,6 @@
 {
   "name": "dsh-gemini-quota",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "在 DeepSeek Harness 输入框显示 Gemini 额度条，点开即多号池面板：逐号剩余额度、启停冷却、检测保活、一键切号",
   "license": "MIT",
   "type": "module",

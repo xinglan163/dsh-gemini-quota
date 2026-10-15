@@ -25,6 +25,7 @@ window.__ModuleLoader__.load({
     const QUOTA_ROUTE = "/plugins/dsh-gemini-quota/quota";
     const POOL_ROUTE = "/plugins/dsh-gemini-quota/pool";
     const ACCOUNT_ROUTE = "/plugins/dsh-gemini-quota/account";
+    const ACTUAL_ROUTE = "/plugins/dsh-gemini-quota/actual";
     const POLL_MS = 60000; // 服务端有 20s 缓存，60s 轮询足够且不打扰上游
     const MAX_BACKOFF_MS = 15 * 60000;
     const TRACK_W = 56;
@@ -449,7 +450,7 @@ window.__ModuleLoader__.load({
       );
     }
 
-    function PoolPanel({ currentAccountId, onClose, panelRef }) {
+    function PoolPanel({ currentAccountId, actual, onClose, panelRef }) {
       const [pool, setPool] = React.useState(undefined);
       const [quotas, setQuotas] = React.useState({});
       const [note, setNote] = React.useState(undefined);
@@ -602,6 +603,68 @@ window.__ModuleLoader__.load({
       const accounts = pool?.accounts ?? [];
       const unsupported = Object.values(quotas).some((q) => q?.state === "unsupported");
 
+      // ── 降级告警条 ──
+      // 额度条亮红灯时，面板顶部给出"为什么"和"怎么办"。
+      // 「额度最充足的号」用面板已经拿到的逐号额度来选；选不出来（额度还没到 / 都判不了）
+      // 就退化成"任一可用的号"——不能让用户卡在这里没有出路。
+      const downgraded = actual?.downgraded === true && actual.latest ? actual.latest : null;
+      const remainOf = (account) => {
+        const q = quotas[account.id];
+        return q?.state === "ok" && typeof q.fiveHour?.remainPercent === "number"
+          ? q.fiveHour.remainPercent
+          : undefined;
+      };
+      const bannerBest = accounts
+        .filter((a) => a.status === "enabled" && (currentAccountId === undefined || a.id !== currentAccountId))
+        .slice()
+        .sort((x, y) => (remainOf(y) ?? -1) - (remainOf(x) ?? -1))[0];
+      const banner = downgraded
+        ? h(
+            "div",
+            {
+              style: {
+                display: "flex",
+                flexDirection: "column",
+                gap: 5,
+                marginBottom: 8,
+                padding: "6px 8px",
+                borderRadius: 8,
+                border: "1px solid var(--dsw-alias-state-warn-primary, #fbbf24)",
+                background:
+                  "color-mix(in srgb, var(--dsw-alias-state-warn-primary, #fbbf24) 12%, transparent)",
+              },
+            },
+            h(
+              "div",
+              { style: { fontSize: 11, lineHeight: "15px", color: PRIMARY, fontWeight: 600 } },
+              `⚠️ 最近一次请求被降级：请求 ${downgraded.requested}，实际 ${downgraded.actual}`,
+            ),
+            h(
+              "div",
+              { style: { fontSize: 10, lineHeight: "14px", color: MUTED } },
+              "上游在额度耗尽时会静默换成更弱的模型，但 HTTP 仍返回 200 —— 这一轮的回答质量不能按你选的模型算。",
+            ),
+            pool?.canMutate !== false && bannerBest
+              ? h(
+                  "div",
+                  { style: { display: "flex", justifyContent: "flex-end" } },
+                  h(
+                    SmallButton,
+                    {
+                      onClick: () => runAction("switch", bannerBest),
+                      disabled: busyId !== 0,
+                      tone: pendingSwitch === bannerBest.id ? "danger" : "primary",
+                      title: `把请求切到 #${bannerBest.id}（会启用它并停用其它已启用的号）`,
+                    },
+                    pendingSwitch === bannerBest.id
+                      ? "确认切换"
+                      : `切到额度最充足的号（#${bannerBest.id}）`,
+                  ),
+                )
+              : null,
+          )
+        : null;
+
       const header = h(
         "div",
         { style: { display: "flex", alignItems: "center", gap: 6, marginBottom: 8 } },
@@ -724,6 +787,7 @@ window.__ModuleLoader__.load({
           },
         },
         header,
+        banner,
         body,
         ...footer,
       );
@@ -738,6 +802,7 @@ window.__ModuleLoader__.load({
         () => (directory ? directory.getSnapshot() : undefined),
       );
       const [snapshot, setSnapshot] = React.useState(undefined);
+      const [actual, setActual] = React.useState(undefined);
       const [scope, setScope] = React.useState(undefined); // { providers, matchModelPrefix }
       const [tip, setTip] = React.useState(false);
       const [open, setOpen] = React.useState(false);
@@ -810,7 +875,7 @@ window.__ModuleLoader__.load({
           timer = undefined;
           // 页面不可见时不轮询，回到前台立刻补一次
           if (!disposed && !document.hidden) {
-            timer = window.setTimeout(refresh, Math.max(0, nextAt - Date.now()));
+            timer = window.setTimeout(cycle, Math.max(0, nextAt - Date.now()));
           }
         };
 
@@ -836,7 +901,27 @@ window.__ModuleLoader__.load({
           }
         };
 
-        refresh();
+        // 降级守卫与额度同一节奏刷。它失败一律当"不知道"（不亮红灯）——
+        // 旧宿主半没有这条路由时只是 404，绝不能影响额度条本身。
+        const refreshActual = async () => {
+          try {
+            const res = await fetch(ACTUAL_ROUTE, {
+              method: "GET",
+              credentials: "same-origin",
+              headers: { accept: "application/json" },
+              signal: controller.signal,
+            });
+            const value = res.ok ? await res.json().catch(() => undefined) : undefined;
+            if (!disposed) setActual(value?.ok === true ? value : undefined);
+          } catch {
+            if (!disposed) setActual(undefined);
+          }
+        };
+        const cycle = () => {
+          refresh();
+          refreshActual();
+        };
+        cycle();
         document.addEventListener("visibilitychange", schedule);
         return () => {
           disposed = true;
@@ -894,14 +979,27 @@ window.__ModuleLoader__.load({
       if (rows.length === 0) return null;
 
       const detail = rows.map((r) => r.summary).join("；");
-      const label = snapshot.account ? `${detail}（账号 ${snapshot.account}）` : detail;
+      // 降级 = 最近一次可判定的请求，上游实际给的不是你选的模型
+      const downgraded = actual?.downgraded === true && actual.latest ? actual.latest : null;
+      const label =
+        (snapshot.account ? `${detail}（账号 ${snapshot.account}）` : detail) +
+        (downgraded
+          ? `；警告：最近一次请求被降级，请求 ${downgraded.requested}，实际 ${downgraded.actual}`
+          : "");
 
       // 悬停浮层：一行一个信息（额度、重置时间各占一行），账号单独一行。
       // 这里只消费上面算好的 remainText / resetLabel，不再直接摸 raw 字段，避免字段名写错又出 undefined。
-      const tipLines = rows.flatMap((r) => [
-        `${r.short} 额度：剩余 ${r.remainText}`,
-        `${r.short} 重置：${r.resetLabel}`,
-      ]);
+      // 降级警告放最前面：它比任何额度数字都重要（额度低只是原因，降级才是后果）。
+      const tipLines = [];
+      if (downgraded) {
+        tipLines.push(`⚠️ 最近一次请求被降级：请求 ${downgraded.requested}，实际 ${downgraded.actual}`);
+      }
+      tipLines.push(
+        ...rows.flatMap((r) => [
+          `${r.short} 额度：剩余 ${r.remainText}`,
+          `${r.short} 重置：${r.resetLabel}`,
+        ]),
+      );
       if (snapshot.account) tipLines.push(`账号：${snapshot.account}`);
       tipLines.push("点一下：账号池面板");
 
@@ -910,7 +1008,7 @@ window.__ModuleLoader__.load({
         {
           ref: wrapRef,
           role: "status",
-          "data-gemini-quota": rows.map((r) => r.kind).join(","),
+          "data-gemini-quota": [...rows.map((r) => r.kind), ...(downgraded ? ["downgraded"] : [])].join(","),
           "aria-label": label,
           "aria-expanded": open,
           // 刻意不设 title：原生提示无法定制样式，会和自绘 tooltip 叠成两个。
@@ -936,10 +1034,35 @@ window.__ModuleLoader__.load({
             gap: 6,
             padding: "1px 2px",
             cursor: "pointer",
+            // 降级时整条染成警告色：这是"你刚才那句话不是你以为的模型答的"，
+            // 必须比额度条本身更显眼，否则用户永远注意不到。
+            ...(downgraded
+              ? {
+                  borderRadius: 6,
+                  background:
+                    "color-mix(in srgb, var(--dsw-alias-state-warn-primary, #fbbf24) 14%, transparent)",
+                  boxShadow:
+                    "inset 0 0 0 1px color-mix(in srgb, var(--dsw-alias-state-warn-primary, #fbbf24) 55%, transparent)",
+                }
+              : {}),
           },
         },
         // Gemini 官方 logo（内联 SVG，渐变填色），替代原来的 ✦ 星形字符
         h(GeminiMark, { size: 14 }),
+        downgraded
+          ? h(
+              "span",
+              {
+                style: {
+                  fontSize: 11,
+                  lineHeight: "12px",
+                  color: "var(--dsw-alias-state-warn-primary, #fbbf24)",
+                },
+                "aria-hidden": true,
+              },
+              "⚠️",
+            )
+          : null,
         h(
           "span",
           {
@@ -990,6 +1113,7 @@ window.__ModuleLoader__.load({
         open
           ? h(PoolPanel, {
               currentAccountId: snapshot.accountId,
+              actual,
               onClose: () => setOpen(false),
             })
           : null,

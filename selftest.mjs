@@ -5,6 +5,7 @@
 // 反代没在跑时，依赖上游的用例会标记 SKIP 而不是失败（发布后别人也能跑）。
 import { apply } from "./index.js";
 import { EventEmitter } from "node:events";
+import { createServer } from "node:http";
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -12,6 +13,7 @@ import { join } from "node:path";
 const ROUTES = {
   quota: "/plugins/dsh-gemini-quota/quota",
   pool: "/plugins/dsh-gemini-quota/pool",
+  actual: "/plugins/dsh-gemini-quota/actual",
   account: "/plugins/dsh-gemini-quota/account",
 };
 
@@ -209,7 +211,7 @@ for (const [label, opts] of [
     expect(status === 403, `${label} ${path} 期望 403，实际 ${status}`);
     expect(Array.isArray(json.providers), `${label} 的 403 响应也应带 scope`);
   }
-  passed.push(`${label} 403（三条路由都拦截，且带 scope）`);
+  passed.push(`${label} 403（四条路由都拦截，且带 scope）`);
 }
 
 // 5) 方法闸门
@@ -217,34 +219,35 @@ for (const [label, opts] of [
   const wrong = [
     [routes.get(ROUTES.quota), fakeReq({ method: "POST" })],
     [routes.get(ROUTES.pool), fakeReq({ method: "POST", url: ROUTES.pool })],
+    [routes.get(ROUTES.actual), fakeReq({ method: "POST", url: ROUTES.actual })],
     [routes.get(ROUTES.account), fakeReq({ method: "GET", url: ROUTES.account })],
   ];
   for (const [current, req] of wrong) {
     const { status } = await call(current, req);
     expect(status === 405, `${current.path} 方法闸门期望 405，实际 ${status}`);
   }
-  passed.push("方法闸门：/quota /pool 只收 GET，/account 只收 POST");
+  passed.push("方法闸门：/quota /pool /actual 只收 GET，/account 只收 POST");
 }
 
 // 6) 无 token → 503（显式 envFile 指向不存在的文件时，不回落到 $DSH_HOME）
 {
   const bare = mount({ tokenEnv: "DSH_QUOTA_SELFTEST_UNSET", envFile: "/nonexistent/dsh-quota.env" });
-  for (const path of [ROUTES.quota, ROUTES.pool]) {
+  for (const path of [ROUTES.quota, ROUTES.pool, ROUTES.actual]) {
     const { status, json } = await call(bare.get(path), fakeReq({ url: path }));
     expect(status === 503, `${path} 期望 503，实际 ${status}`);
     expect(json.error === "no admin token", `期望 no admin token，实际 ${JSON.stringify(json)}`);
   }
-  passed.push("token 四个来源都未命中 → 503（/quota 与 /pool）");
+  passed.push("token 四个来源都未命中 → 503（/quota /pool /actual）");
 }
 
 // 7) 上游不可达 → 502
 {
   const down = mount({ token: "x", baseUrl: "http://127.0.0.1:9", timeoutMs: 800 });
-  for (const path of [ROUTES.quota, ROUTES.pool]) {
+  for (const path of [ROUTES.quota, ROUTES.pool, ROUTES.actual]) {
     const { status } = await call(down.get(path), fakeReq({ url: path }));
     expect(status === 502, `${path} 期望 502，实际 ${status}`);
   }
-  passed.push("上游不可达 → 502（/quota 与 /pool）");
+  passed.push("上游不可达 → 502（/quota /pool /actual）");
 }
 
 // 8) providers 可配置
@@ -274,7 +277,94 @@ for (const [label, opts] of [
   }
 }
 
-// 10) 浏览器半：模块契约冒烟（不渲染，只验证 bundle 能加载 + 接线正确）
+// 10) 降级判定：stub 上游精确控制 /admin/api/requests 的返回
+//
+// 为什么要 stub 而不能只靠真反代：真反代里现在全是「4 Argon → 4 Argon」，
+// 降级、"判不了"、"跳过判不了的"这三条分支根本走不到。
+{
+  const startStub = async (rows) => {
+    const seen = [];
+    const server = createServer((req, res) => {
+      seen.push(req.url);
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ items: rows, limit: 5, offset: 0, total: rows.length }));
+    });
+    await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+    return {
+      url: `http://127.0.0.1:${server.address().port}`,
+      seen,
+      close: () => new Promise((resolve) => server.close(resolve)),
+    };
+  };
+  const probe = async (stub) => {
+    const { status, json } = await call(
+      mount({ token: "x", baseUrl: stub.url }).get(ROUTES.actual),
+      fakeReq({ url: ROUTES.actual }),
+    );
+    await stub.close();
+    return { status, json };
+  };
+
+  const cases = [
+    ["正常：请求 4 Argon，上游也回 4 Argon", [{ model: "gemini-4-argon", upstream_model: "4 Argon" }], "ok", false],
+    ["降级：请求 4 Argon，上游回 3.5 Flash-Lite", [{ model: "gemini-4-argon", upstream_model: "3.5 Flash-Lite" }], "downgraded", true],
+    ["降级：3.8 Flash → 3.5 Flash Lite（无连字符也认）", [{ model: "gemini-3.8-flash", upstream_model: "3.5 Flash Lite" }], "downgraded", true],
+    ["改名容忍：3.7 的 id 遇到 3.8 的显示名", [{ model: "gemini-3.7-flash", upstream_model: "3.8 Flash" }], "ok", false],
+    ["思考档：4 Argon High 仍算 4 Argon", [{ model: "gemini-4-argon-thinking", upstream_model: "4 Argon High" }], "ok", false],
+    ["判不了：上游没自报显示名", [{ model: "gemini-4-argon", upstream_model: "" }], "unknown", false],
+    ["判不了：表里没有的模型（生图）不误报", [{ model: "gemini-image", upstream_model: "3.5 Flash-Lite" }], "unknown", false],
+  ];
+  for (const [name, rows, verdict, downgraded] of cases) {
+    const stub = await startStub(rows);
+    const { status, json } = await probe(stub);
+    expect(status === 200 && json.ok === true, `${name}：期望 200 ok，实际 ${status} ${JSON.stringify(json)}`);
+    expect(json.latest?.verdict === verdict, `${name}：期望 verdict=${verdict}，实际 ${json.latest?.verdict}`);
+    expect(json.downgraded === downgraded, `${name}：期望 downgraded=${downgraded}，实际 ${json.downgraded}`);
+  }
+  passed.push(`降级判定 ${cases.length} 种情形（降级 / 正常 / 改名容忍 / 判不了不误报）`);
+
+  // 最新一条判不了时，不能把更早的一次真实降级藏起来
+  {
+    const stub = await startStub([
+      { model: "gemini-image", upstream_model: "" },
+      { model: "gemini-4-argon", upstream_model: "3.5 Flash-Lite" },
+    ]);
+    const { json } = await probe(stub);
+    expect(json.downgraded === true, `跳过"判不了"后应仍能发现降级，实际 ${JSON.stringify(json.latest)}`);
+    expect(json.latest?.requested === "gemini-4-argon", `latest 应取到可判定的那条，实际 ${JSON.stringify(json.latest)}`);
+    passed.push("跳过判不了的：最新是生图、前一条才是降级时仍报警");
+  }
+
+  // 只白名单字段：上游多给了内容字段也不能透传（将来 SQL 加列也不会顺手泄露）
+  {
+    const stub = await startStub([
+      { model: "gemini-4-argon", upstream_model: "4 Argon", prompt: "SECRET_PROMPT", response: "SECRET_BODY" },
+    ]);
+    const { json } = await probe(stub);
+    expect(!JSON.stringify(json).includes("SECRET"), "响应里出现了上游的内容字段（字段白名单失效）");
+    passed.push("字段白名单：上游的 prompt / response 不会被透传");
+  }
+
+  // 入参校验 + 上限钳制（bad 请求必须在上游之前就被挡掉）
+  {
+    const stub = await startStub([]);
+    const bad = await call(
+      mount({ token: "x", baseUrl: stub.url }).get(ROUTES.actual),
+      fakeReq({ url: `${ROUTES.actual}?limit=abc` }),
+    );
+    expect(bad.status === 400, `limit=abc 期望 400，实际 ${bad.status}`);
+    await call(
+      mount({ token: "x", baseUrl: stub.url }).get(ROUTES.actual),
+      fakeReq({ url: `${ROUTES.actual}?limit=999` }),
+    );
+    await stub.close();
+    expect(stub.seen.length === 1, `坏 limit 不该打到上游，实际上游收到 ${stub.seen.length} 次`);
+    expect(stub.seen[0] === "/admin/api/requests?limit=20", `limit 应钳到 20，实际上游收到 ${stub.seen[0]}`);
+    passed.push("limit 校验与钳制（非数字 400 且不打上游，超上限钳到 20）");
+  }
+}
+
+// 11) 浏览器半：模块契约冒烟（不渲染，只验证 bundle 能加载 + 接线正确）
 //     能抓到的：语法错误、bundle id 与包名不符、apply 里引用了不存在的 service、
 //     座位名写错。抓不到的：React 渲染期的错误（那得真在浏览器里点一次）。
 {
@@ -325,6 +415,96 @@ for (const [label, opts] of [
   expect(slotRegistrations.length === 1, `期望注册 1 个组件，实际 ${slotRegistrations.length}`);
   expect(slotRegistrations[0].def.id === "gemini-web-quota", `座位 id 异常：${slotRegistrations[0].def.id}`);
   passed.push("浏览器半冒烟：bundle id = 包名，apply 正确注册 conversation.input.right");
+}
+
+// 12) 额度条渲染：降级时到底会不会亮红灯
+//
+// 用"按 hook 调用顺序喂 state"的假 React 把组件真调一次——渲染期的错误
+// （字段名写错、h() 参数错位、条件分支写反）只有真走一遍才抓得到。
+{
+  const renderPill = (states) => {
+    let cursor = 0;
+    const fakeReact = {
+      createElement: (type, props, ...children) => ({ type, props: props ?? {}, children }),
+      useState: () => [states[cursor++], () => {}],
+      useEffect: () => {},
+      useRef: (value) => ({ current: value }),
+      // 门控靠它：组件要求 status === "ready" 且 provider 命中（见 matchesScope），
+      // 返回 undefined 会让整条额度条渲染成 null，测不到任何东西。
+      useSyncExternalStore: () => ({
+        status: "ready",
+        current: { provider: "gemini-web", model: "gemini-4-argon" },
+      }),
+      useId: () => ":r0:",
+    };
+    const registered = [];
+    const registrations = [];
+    const fakeScope = {
+      slots: {
+        inject: (_name, cb) => cb(),
+        register: (def, component) => (registrations.push({ def, component }), () => {}),
+      },
+      modelDirectories: { directoryFor: () => ({ store: {} }) },
+    };
+    const fakeRequire = (name) => {
+      if (name === "react") return fakeReact;
+      throw new Error(`浏览器半 require 了平台 seed 之外的模块：${name}`);
+    };
+    const source = readFileSync(new URL("./client.js", import.meta.url), "utf8");
+    new Function("window", "require", source)(
+      { __ModuleLoader__: { load: (definition) => registered.push(definition) } },
+      fakeRequire,
+    );
+    registered[0].factory(fakeRequire).apply({ inject: (_deps, cb) => cb(fakeScope) });
+    return registrations[0].component({ directory: undefined });
+  };
+  const texts = (node, out = []) => {
+    if (node === null || node === undefined || node === false) return out;
+    if (Array.isArray(node)) {
+      for (const child of node) texts(child, out);
+      return out;
+    }
+    if (typeof node === "string" || typeof node === "number") {
+      out.push(String(node));
+      return out;
+    }
+    texts(node.children, out);
+    return out;
+  };
+
+  // hook 顺序：snapshot, actual, scope, tip, open
+  const snap = {
+    ok: true,
+    accountId: 1,
+    account: "Pro(FF导入)",
+    fiveHour: { usedPercent: 95, remainPercent: 5, resetAt: 1792050755, resetInSec: 600 },
+    weekly: { usedPercent: 25, remainPercent: 75, resetAt: 1792486355, resetInSec: 400000 },
+  };
+  const scope = { providers: ["gemini-web"], matchModelPrefix: true };
+  const degraded = {
+    ok: true,
+    downgraded: true,
+    latest: { requested: "gemini-4-argon", actual: "3.5 Flash-Lite", verdict: "downgraded", downgraded: true },
+  };
+  const healthy = { ok: true, downgraded: false, latest: { requested: "gemini-4-argon", actual: "4 Argon", verdict: "ok" } };
+
+  const warn = renderPill([snap, degraded, scope, true, false]);
+  expect(warn !== null, "降级时应渲染出额度条，实际返回 null");
+  expect(
+    warn.props["data-gemini-quota"].includes("downgraded"),
+    `data 属性缺少 downgraded：${warn.props["data-gemini-quota"]}`,
+  );
+  const warnText = texts(warn).join(" | ");
+  expect(warnText.includes("被降级"), `悬停浮层缺少降级说明：${warnText}`);
+  expect(warnText.includes("3.5 Flash-Lite"), `悬停浮层缺少实际模型名：${warnText}`);
+  expect(warn.props["aria-label"].includes("降级"), `aria-label 未提示降级：${warn.props["aria-label"]}`);
+
+  const calm = renderPill([snap, healthy, scope, true, false]);
+  const calmData = calm.props["data-gemini-quota"];
+  const calmText = texts(calm).join(" | ");
+  expect(!calmData.includes("downgraded"), `正常时 data 属性不该带 downgraded：${calmData}`);
+  expect(!calmText.includes("被降级"), `正常时不该出现降级文案：${calmText}`);
+  passed.push("额度条渲染：降级时亮红灯 + 浮层写明实际模型；正常时不误报");
 }
 
 console.log("\n✅ 通过:");

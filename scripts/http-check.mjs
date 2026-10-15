@@ -1,6 +1,6 @@
 // 真 HTTP 集成自检：selftest.mjs 用的是假 req/res，抓不到「真实 HTTP 下 req.url 解析、
 // POST body 读取、Host/Origin 头、响应头」这类问题。这里按 DSH webServer 的契约
-// 起一个真 http server 挂上三条路由，再用真 fetch 打一遍。
+// 起一个真 http server 挂上四条路由，再用真 fetch 打一遍。
 //
 //   node scripts/http-check.mjs
 //
@@ -14,6 +14,7 @@ import { apply } from "../index.js";
 
 const QUOTA_ROUTE = "/plugins/dsh-gemini-quota/quota";
 const POOL_ROUTE = "/plugins/dsh-gemini-quota/pool";
+const ACTUAL_ROUTE = "/plugins/dsh-gemini-quota/actual";
 const ACCOUNT_ROUTE = "/plugins/dsh-gemini-quota/account";
 
 function localToken() {
@@ -112,7 +113,28 @@ console.log("监听:", base, token === "" ? "(没找到 admin token，上游用�
   }
 }
 
-// 3) 写路由的入参校验（都不该真的改状态）
+// 3) 降级守卫（真 HTTP）
+{
+  const { status, json } = await get(ACTUAL_ROUTE);
+  if (status === 502 || status === 503) {
+    skipped.push(`降级路由（反代未运行或未配 token：${json?.error}）`);
+  } else {
+    expect(status === 200 && json.ok === true, `降级路由异常：${status} ${JSON.stringify(json)}`);
+    expect(typeof json.downgraded === "boolean", "downgraded 应为布尔");
+    expect(Array.isArray(json.items), "items 应为数组");
+    expect(!JSON.stringify(json).includes('"prompt"'), "降级视图疑似带上 prompt 字段");
+    expect(!JSON.stringify(json).includes('"response"'), "降级视图疑似带上 response 字段");
+    passed.push(`HTTP GET /actual 200（检查 ${json.checked} 条，downgraded=${json.downgraded}）`);
+
+    const badLimit = await get(`${ACTUAL_ROUTE}?limit=abc`);
+    expect(badLimit.status === 400, `limit=abc 期望 400，实际 ${badLimit.status}`);
+    const wrongMethod = await post(ACTUAL_ROUTE, {});
+    expect(wrongMethod.status === 405, `POST /actual 期望 405，实际 ${wrongMethod.status}`);
+    passed.push("HTTP /actual 入参校验（limit=abc → 400，POST → 405）");
+  }
+}
+
+// 4) 写路由的入参校验（都不该真的改状态）
 {
   const noConfirm = await post(ACCOUNT_ROUTE, { action: "switch", id: 1 });
   expect(noConfirm.status === 400, `switch 未确认期望 400，实际 ${noConfirm.status}`);
@@ -125,7 +147,7 @@ console.log("监听:", base, token === "" ? "(没找到 admin token，上游用�
   passed.push("HTTP 写路由入参校验（switch 未确认 / 未知 action / 坏 JSON → 400，GET → 405）");
 }
 
-// 4) 未注册的路径确实是 404（路由是 exact，不会误吞别的路径）
+// 5) 未注册的路径确实是 404（路由是 exact，不会误吞别的路径）
 {
   const nope = await get("/plugins/dsh-gemini-quota/nope");
   expect(nope.status === 404, `未注册路径期望 404，实际 ${nope.status}`);

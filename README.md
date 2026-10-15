@@ -8,6 +8,8 @@
 - 鼠标悬停显示剩余量与重置时间（含账号），**提示气泡跟随 DSH 主题配色**（明暗主题与皮肤插件都会同步）；
 - **0.2.0 新增账号池面板**：点一下额度条，逐个账号看 5h / 7d 剩余额度，并能直接
   **启用 / 停用（冷却）/ 检测登录态 / 保活 / 切号**——不用切去反代后台网页；
+- **0.3.0 新增降级守卫**：额度耗尽时 Gemini 会**静默换成更弱的模型却仍返回 200**，
+  额度条会染成警告色 + ⚠️，写明「请求 X，实际 Y」，并给一键换号；
 - 数据来自本地 `gemini-web2api-go` 反代的 `/admin/api/*`。
 
 > 本插件是**显示 + 控制层**，不含反代本身。你需要先自己跑一个
@@ -106,12 +108,60 @@ Gemini 账号池   1/2 启用                     [刷新] [反代面板] [✕]
 「反代面板」按钮会新开 `baseUrl/admin/`（反代自带的 web 面板），加 cookie / 配代理这类
 不常做的事还是去那边。
 
+## 降级守卫（0.3.0）
+
+**额度用完后，Gemini 会静默把你的模型换掉，但 HTTP 照样回 200。**
+
+你选了 4 Argon（付费号专属）。当账号 5 小时额度见底时，上游**不报错**，而是把这一轮
+转给更笨的 **3.5 Flash-Lite** 去答，然后正常返回成功。于是 DSH 以为用的是强模型，
+agent 还会理直气壮地说"我做完了"——issue #41 里管这叫「**产生严重幻觉并破坏任务**」。
+
+额度条会**整条染成警告色并加一个 ⚠️**，悬停第一行就是原因：
+
+```
+⚠️ 最近一次请求被降级：请求 gemini-4-argon，实际 3.5 Flash-Lite
+5h 额度：剩余 5%
+账号：Pro(FF导入)
+点一下：账号池面板
+```
+
+点开面板，顶部是告警条 + 一个按钮：**切到额度最充足的号**（两下确认，与行内
+「切到此号」同一套逻辑：启用目标号 + 停用其它已启用的号）。
+
+### 判定规则（以及为什么这么判）
+
+| 情形 | 判定 |
+|---|---|
+| 请求 `gemini-4-argon`，上游自报 `4 Argon` / `4 Argon High` | `ok` |
+| 请求 `gemini-4-argon`，上游自报 `3.5 Flash-Lite` | **`downgraded`** |
+| 上游**没自报**显示名（生图 / 生视频 / 抽取失败） | `unknown` —— **不亮红灯** |
+| 模型不在插件内置表里（例如将来新增） | `unknown` —— **不亮红灯** |
+
+两个刻意的设计：
+
+1. **判不了就说判不了**。`unknown` 绝不等于"没问题"——把"看不见"伪装成"没降级"，
+   比漏报更糟（用户会开始无视这个红灯）。
+2. **上游改名要容忍**。Google 把 3.7 原地升级成 3.8 过（同一个 hex、显示名变了），
+   所以 id→显示名是一张**容错表**，遇到改名不误报。
+
+真相来自反代自己记录的 `upstream_model`（上游在响应帧里自报的显示名）。
+**不能靠响应体判断**：反代回给客户端的 `"model"` 填的是你请求的那个，响应体本身在撒谎。
+
+### 已知边界
+
+- 判定表是插件内置的：**反代新增模型后要更新插件**（否则新模型一律 `unknown`，不误报）；
+- 每次在最近 5 条请求里找「最近一次可判定的」：最新一条是生图时会继续往前找，
+  不会因为一条判不了的请求就把更早的降级藏起来；
+- 它**不能阻止**这一次降级——那要在反代里做（上游 `strict_model`）。插件负责让你
+  **知道**，以及**下一步换号**。
+
 ## 宿主路由
 
 | 路由 | 上游 | 说明 |
 |---|---|---|
 | `GET /plugins/dsh-gemini-quota/quota[?account_id=N][?refresh=1]` | `GET /admin/api/quota` | 额度条数据；`account_id` 是面板逐号查的入口 |
 | `GET /plugins/dsh-gemini-quota/pool` | `GET /admin/api/cookies` | 账号池视图（健康度、失败计数、代理、cookie 摘要） |
+| `GET /plugins/dsh-gemini-quota/actual[?limit=N]` | `GET /admin/api/requests` | 降级守卫：最近几次请求「请求的模型 vs 实际用的模型」（只回元数据，不含 prompt/正文） |
 | `POST /plugins/dsh-gemini-quota/account` | `POST /admin/api/cookies/{id}/{toggle\|check\|rotate}` | 账号动作；`switch` 由插件编排（启用目标 + 停用其余） |
 
 `sapisid_tail` 之类的摘要字段来自反代；**完整 cookie 值不会出现在任何回给浏览器的数据里**。
@@ -121,18 +171,21 @@ Gemini 账号池   1/2 启用                     [刷新] [反代面板] [✕]
 - **宿主半**（`index.js`）把反代 `/admin/api/*` 转成同源路由 `/plugins/dsh-gemini-quota/*`。
   为什么不让浏览器直连反代：反代的 CORS 预检没有 `Access-Control-Allow-Headers`，带
   `Authorization` 的 fetch 会被浏览器拒；用 `?token=` 又能过但会把 admin token 泄进前端产物。
-- 三条路由都自带最小信任闸门（回环对端 + 回环 Host + 非 cross-site + 同源 Origin），
+- 四条路由都自带最小信任闸门（回环对端 + 回环 Host + 非 cross-site + 同源 Origin），
   `POST /account` 另有 `readOnly` 开关和入参校验。
 - 面板的逐号额度是**打开面板时才按需并发查**（3 个 worker），一旦发现反代不支持
   `?account_id=N` 就立刻停手并如实标注，不白打上游。
 - 路由同时下发 `providers` / `matchModelPrefix`：浏览器半拿不到 cordis config
   （client-modules 只传 `{ name: id }`），所以门控范围必须由宿主告知。
+- **降级判定必须在宿主半做**：响应体里的 `"model"` 是「你请求的」（反代原样回填），
+  真相只在上游自报的 `upstream_model` 里，而那个字段只有反代的 admin API 才给得出来。
 
 ## 自测
 
 ```sh
 node --check index.js && node --check client.js
-node selftest.mjs              # 宿主半：路由/闸门/token 链/字段映射 + 浏览器半模块契约冒烟
+node selftest.mjs              # 20 项：路由/闸门/token 链/字段映射 + 降级判定 7 情形（stub 上游）
+                               #      + 额度条渲染（降级亮灯 / 正常不误报）+ 浏览器半契约冒烟
 node scripts/http-check.mjs    # 真起一个 http server，用真 fetch 打一遍三条路由
 ```
 
@@ -143,6 +196,8 @@ node scripts/http-check.mjs    # 真起一个 http server，用真 fetch 打一�
 | 现象 | 原因 |
 |---|---|
 | 悬停提示正常但**条一直不出现** | 当前模型不在 `providers` 里；改配置或开 `matchModelPrefix` |
+| 额度条**染成警告色 + ⚠️** | 最近一次请求被静默降级（响应体里看不出来，悬停看「请求 X 实际 Y」） |
+| 降级判定一直是 `unknown`（不亮灯） | 上游没自报显示名，或该模型不在插件内置表里——**这是刻意的，不是故障** |
 | 控制台/路由 503 `no admin token` | token 四个来源都没命中 |
 | 502 `upstream ...` | 反代没跑、端口不对、或 admin token 无效 |
 | 面板整行都显示 `—` 并提示「按号查额度不支持」 | 反代的 `/admin/api/quota` 没打 `?account_id=N` 扩展（见文件头说明） |

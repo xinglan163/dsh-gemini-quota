@@ -9,6 +9,21 @@
 //   GET  /plugins/dsh-gemini-quota/pool     账号池状态（读 /admin/api/cookies）
 //   POST /plugins/dsh-gemini-quota/account  账号动作（toggle / check / rotate / switch）
 //
+// 0.3.0 起多了「降级守卫」：
+//   GET  /plugins/dsh-gemini-quota/actual   最近几次请求「请求的模型 vs 实际用的模型」
+//
+// 为什么需要它：Gemini 网页端在账号额度耗尽时会**静默降级**——把你的 4 Argon 换成更笨的
+// 3.5 Flash-Lite，但 HTTP 依然返回 200。于是 DSH 以为自己用的是强模型，agent 还会
+// "信誓旦旦说做完了"（issue #41 原话：产生严重幻觉并破坏任务）。
+//
+// 判定依据在反代里**早就有了**：每次请求都会把上游在响应帧里自报的显示名存进
+// upstream_model（internal/app/gemini.go:207 → db.go:186），并通过
+// GET /admin/api/requests 暴露。只是从来没有代码去读它。
+//
+// 注意：**不能靠响应体判断**。反代回给客户端的 OpenAI 响应里 "model" 填的是
+// 「你请求的那个」（internal/app/server.go:383 ← resolveModel(modelInput)），
+// 也就是说响应体本身在撒谎。真相只在反代的 DB 里，所以必须由宿主半去查。
+//
 // 为什么必须由宿主代理（不能浏览器直连 8083）：
 //   gemini-web2api 的 writeJSON 会设 Access-Control-Allow-Origin: *，但**不设**
 //   Access-Control-Allow-Headers / -Methods，/admin/api/* 也没有 OPTIONS 分支
@@ -44,12 +59,92 @@ import { join } from "node:path";
 const QUOTA_ROUTE = "/plugins/dsh-gemini-quota/quota";
 const POOL_ROUTE = "/plugins/dsh-gemini-quota/pool";
 const ACCOUNT_ROUTE = "/plugins/dsh-gemini-quota/account";
+const ACTUAL_ROUTE = "/plugins/dsh-gemini-quota/actual";
 const DEFAULT_BASE_URL = "http://127.0.0.1:8083";
 const DEFAULT_TOKEN_ENV = "GEMINI_WEB_ADMIN_TOKEN";
 const DEFAULT_PROVIDERS = ["gemini-web"];
 const MAX_BODY_BYTES = 4096;
 // 面板一次最多操作多少个账号（切号会遍历整个池；设个上限防止池子异常大时把上游打爆）。
 const MAX_ACCOUNTS = 100;
+// 降级判定一次看几条请求：只看最近一条会被"生图/生视频"这类没有上游显示名的请求挡住，
+// 多看几条才能在最近一条判不了时继续往前找一条能判的。
+const DEFAULT_ACTUAL_LIMIT = 5;
+const MAX_ACTUAL_LIMIT = 20;
+
+// 模型 id → 上游自报显示名里**必须出现**的片段（判定前两边都会规范化）。
+//
+// 这张表是"有没有被降级"的唯一判据：请求的是 A，上游自报的是别的 → 降级。
+// 为什么不从反代读这张表：反代里根本没有（`gw argon` 是打印两列让人眼对比的），
+// 而且上游显示名会随 Google 改名漂移（3.7 → 3.8 就发生过一次）。
+//
+// 两个刻意的设计：
+//   1. 表里没有的 id 一律判 unknown，**绝不猜**——生图/生视频/画布这些模型上游
+//      不一定回显示名，误报比漏报更糟（用户会开始无视这个红灯）。
+//   2. thinking 变体与普通版共用同一个 hex，上游显示名不带 thinking（实测 4 Argon
+//      开思考也只回报 "4 Argon High"），所以两者共用同一个片段。
+const EXPECTED_UPSTREAM = {
+  "gemini-4-argon": ["4 argon"],
+  "gemini-4-argon-thinking": ["4 argon"],
+  "gemini-3.8-flash": ["3.8 flash"],
+  "gemini-3.7-flash": ["3.8 flash", "3.7 flash"],
+  "gemini-3.8-flash-thinking": ["3.8 flash"],
+  "gemini-3.7-flash-thinking": ["3.8 flash", "3.7 flash"],
+  "gemini-3.6-flash": ["3.6 flash"],
+  "gemini-3.6-flash-thinking": ["3.6 flash"],
+  "gemini-3.1-pro": ["3.1 pro"],
+  "gemini-3.1-pro-thinking": ["3.1 pro"],
+  "gemini-3.5-flash-lite": ["3.5 flash lite"],
+  "gemini-3.5-flash-lite-thinking": ["3.5 flash lite"],
+};
+
+/** 规范化模型名：小写 + 非字母数字点一律折叠成单个空格（"3.5 Flash-Lite" → "3.5 flash lite"）。 */
+function normalizeModelName(value) {
+  return String(value ?? "")
+    .toLowerCase()
+    .replace(/[^a-z0-9.]+/gu, " ")
+    .trim();
+}
+
+/**
+ * 判定一次请求有没有被静默降级。
+ * @returns {"ok" | "downgraded" | "unknown"} unknown 表示判不了——**不能当成"没问题"**。
+ */
+function classifyActual(requested, actual) {
+  const raw = String(actual ?? "").trim();
+  // 上游没自报显示名（生图/生视频/旧版反代/抽取失败）→ 判不了。
+  // 这里绝不能返回 ok：那等于把"看不见"伪装成"没问题"。
+  if (raw === "") return "unknown";
+  const expected = EXPECTED_UPSTREAM[String(requested ?? "").trim()];
+  if (expected === undefined) return "unknown";
+  const hay = normalizeModelName(raw);
+  return expected.some((token) => hay.includes(normalizeModelName(token))) ? "ok" : "downgraded";
+}
+
+/**
+ * 反代 /admin/api/requests 的一条 item → 降级判定用的紧凑视图。
+ *
+ * **只白名单字段**：上游那条 SQL 目前只回元数据（不含 prompt/正文），但这里仍然逐个
+ * 字段显式挑出来，避免将来上游往里加了内容字段后被顺手透传出去。
+ */
+function requestView(raw) {
+  const requested = String(raw.model ?? "");
+  const actual = String(raw.upstream_model ?? "");
+  const verdict = classifyActual(requested, actual);
+  return {
+    id: Number(raw.id ?? 0),
+    ts: Number(raw.ts ?? 0),
+    endpoint: String(raw.endpoint ?? ""),
+    requested,
+    actual,
+    verdict,
+    downgraded: verdict === "downgraded",
+    status: Number(raw.status ?? 0),
+    accountId: Number(raw.account_id ?? 0) || undefined,
+    accountLabel: String(raw.account_label ?? ""),
+    stream: raw.stream === true,
+    totalMs: Number(raw.total_ms ?? 0),
+  };
+}
 
 /** 配置里既接受数组也接受 "a,b c" 这种字符串；空则退回默认值。 */
 function asStringList(value, fallback) {
@@ -376,6 +471,49 @@ export function apply(ctx, config = {}) {
           // 面板里「打开反代后台」按钮用。回环地址，不算敏感信息。
           panelUrl: `${baseUrlOf(config)}/admin/`,
           accounts,
+        });
+      } catch (error) {
+        json(502, { ok: false, error: String(error?.message ?? error) });
+      }
+    });
+
+    // ── GET /actual：最近几次请求「请求的模型 vs 实际用的模型」──
+    //
+    // 降级守卫的判据来源。响应体里的 model 是「你请求的」（反代原样回填，
+    // internal/app/server.go:383），真相只在反代的 /admin/api/requests 里，
+    // 所以必须由宿主半去查——浏览器半看不到，直连 8083 又会撞 CORS。
+    register(ACTUAL_ROUTE, "actual route", async (req, res) => {
+      const json = makeJson(res);
+      if (guard(req, res, json, "GET")) return;
+
+      const query = queryOf(req);
+      const rawLimit = (query.get("limit") ?? "").trim();
+      let limit = DEFAULT_ACTUAL_LIMIT;
+      if (rawLimit !== "") {
+        if (!/^\d+$/u.test(rawLimit)) {
+          json(400, { ok: false, error: "bad limit" });
+          return;
+        }
+        limit = Math.min(MAX_ACTUAL_LIMIT, Math.max(1, Number(rawLimit)));
+      }
+
+      try {
+        const upstream = await httpJson(
+          `${baseUrlOf(config)}/admin/api/requests?limit=${limit}`,
+          { token: token(), timeoutMs: timeoutMs() },
+        );
+        const rawItems = Array.isArray(upstream.items) ? upstream.items : [];
+        const items = rawItems.slice(0, limit).map(requestView);
+        // 「最近一次能判定的请求」：生图/生视频这类没有上游显示名的请求会被跳过，
+        // 但不能因为它排在最前面，就把更早的一次真实降级藏起来。
+        const latest = items.find((item) => item.verdict !== "unknown") ?? items[0] ?? null;
+        json(200, {
+          ok: true,
+          fetchedAt: Math.floor(Date.now() / 1000),
+          checked: items.length,
+          downgraded: latest !== null && latest.verdict === "downgraded",
+          latest,
+          items,
         });
       } catch (error) {
         json(502, { ok: false, error: String(error?.message ?? error) });
