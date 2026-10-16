@@ -61,7 +61,13 @@ if [ -n "$(git status --porcelain)" ]; then
 else
   echo "  工作区已干净，无需提交"
 fi
-run git tag "v${version}"
+# tag 已存在就跳过：否则"提到版本 → 打 tag → publish 失败"之后再重跑，
+# 会在这一行 fatal: tag already exists 直接中止，明明只差发布这一步却发不出去。
+if git rev-parse -q --verify "refs/tags/v${version}" >/dev/null 2>&1; then
+  echo "  tag v${version} 已存在，跳过"
+else
+  run git tag "v${version}"
+fi
 run git push origin main --tags
 
 echo "== 4. 发布到 npm（接下来会提示输入 6 位 OTP）=="
