@@ -809,11 +809,6 @@ window.__ModuleLoader__.load({
       const [tip, setTip] = React.useState(false);
       const [open, setOpen] = React.useState(false);
       const wrapRef = React.useRef(null);
-      // 最近一次**真正在服务**的账号（取自 /actual 的最后一条请求）。额度条跟着它走：
-      // /quota 不带参数时反代报的是"下一个会用的号"，而开了额度感知选号之后请求会在号
-      // 之间改道 —— 两者经常不是同一个，UI 就会一直显示另一个号（实测踩到）。
-      const servingRef = React.useRef(0);
-      const askedRef = React.useRef(0); // 上次额度请求问的是哪个号，避免重复触发
       const refreshRef = React.useRef(null); // 给面板动作用：动作后立刻刷一次额度
 
       const eligible = scope !== undefined && matchesScope(directoryState, scope);
@@ -890,11 +885,11 @@ window.__ModuleLoader__.load({
         const refresh = async () => {
           if (disposed || document.hidden) return;
           try {
-            // 按号查而不是让反代自己挑：要显示的是"正在服务你的那个号"的额度。
-            const serving = servingRef.current;
-            askedRef.current = serving;
-            const target = serving > 0 ? `${QUOTA_ROUTE}?account_id=${serving}` : QUOTA_ROUTE;
-            const res = await fetch(target, {
+            // 不带 account_id：让反代按它自己的调度规则报出**下一个请求会用的号**。
+            // 这样额度条 = 你下一条消息会用的那个号，和自己点「切到此号」的结果一致。
+            //（按"最近一条请求的号"显示是不对的：切号那一刻还没有请求落到新号上，
+            //  UI 会一直挂着旧号 —— 甚至旧号已经停用了还标着「当前」，实测踩到。）
+            const res = await fetch(QUOTA_ROUTE, {
               method: "GET",
               credentials: "same-origin",
               headers: { accept: "application/json" },
@@ -926,13 +921,6 @@ window.__ModuleLoader__.load({
             });
             const value = res.ok ? await res.json().catch(() => undefined) : undefined;
             if (!disposed) setActual(value?.ok === true ? value : undefined);
-            // 服务你的号换了 → 额度立刻跟上，不等下一个 60 秒周期
-            //（"账号切了但 UI 没切"的第二个来源就是轮询间隔）。
-            const serving = Number(value?.latest?.accountId ?? 0) || 0;
-            if (!disposed && serving > 0 && serving !== servingRef.current) {
-              servingRef.current = serving;
-              if (serving !== askedRef.current) refresh();
-            }
           } catch {
             if (!disposed) setActual(undefined);
           }
